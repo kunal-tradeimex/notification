@@ -45,11 +45,11 @@ model ApiKey {
   @@map("api_keys")
 }
 
-// ── CONTACTS ──────────────────────────────────────────
+// ── CONTACTS (RECIPIENTS) ─────────────────────────────
 model Contact {
   id           String   @id @default(uuid())
   tenantId     String
-  externalId   String?             // your app's user ID
+  externalId   String               // your client app's user ID
   email        String?
   phone        String?
   deviceTokens String[]
@@ -75,7 +75,7 @@ model Template {
   slug      String
   channel   ChannelType
   subject   String?
-  body      String                  // Handlebars template
+  body      String      // Handlebars / Liquid engine template
   variables Json        @default("[]")
   isActive  Boolean     @default(true)
   version   Int         @default(1)
@@ -95,8 +95,8 @@ model ChannelConfig {
   id          String      @id @default(uuid())
   tenantId    String
   channel     ChannelType
-  provider    String                // "sendgrid" | "smtp" | "twilio"
-  credentials Json                  // encrypt at app level before saving
+  provider    String      // "sendgrid" | "smtp" | "twilio" | "fcm"
+  credentials Json        // encrypt at app level before saving
   isActive    Boolean     @default(true)
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
@@ -112,16 +112,23 @@ model ChannelConfig {
 model Notification {
   id             String             @id @default(uuid())
   tenantId       String
-  contactId      String?
-  templateId     String?
+  contactId      String             // Changed to REQUIRED
+  templateId     String             // Changed to REQUIRED
   channel        ChannelType
   status         NotificationStatus @default(PENDING)
   priority       Priority           @default(NORMAL)
-  to             String
+  to             String             // Final target destination (e.g. user's email or phone)
   subject        String?
-  body           String
-  data           Json               @default("{}")
+  body           String             // Compiled text sent out
+  data           Json               @default("{}") // Incoming request variables
   idempotencyKey String?            @unique
+  
+  // NEW: Fields for In-App Notification Feed tracking
+  isRead         Boolean            @default(false)
+  isSeen         Boolean            @default(false)
+  readAt         DateTime?
+  seenAt         DateTime?
+
   scheduledAt    DateTime?
   sentAt         DateTime?
   deliveredAt    DateTime?
@@ -133,14 +140,15 @@ model Notification {
   createdAt      DateTime           @default(now())
   updatedAt      DateTime           @updatedAt
 
-  tenant   Tenant    @relation(fields: [tenantId], references: [id])
-  contact  Contact?  @relation(fields: [contactId], references: [id])
-  template Template? @relation(fields: [templateId], references: [id])
-  events   NotificationEvent[]
+  tenant     Tenant              @relation(fields: [tenantId], references: [id])
+  contact    Contact             @relation(fields: [contactId], references: [id])
+  template   Template            @relation(fields: [templateId], references: [id])
+  events     NotificationEvent[]
 
   @@index([tenantId])
   @@index([status])
   @@index([scheduledAt])
+  @@index([contactId, isRead])  // High-performance index for in-app unread badges
   @@index([tenantId, status])
   @@index([tenantId, createdAt])
   @@map("notifications")
@@ -199,4 +207,9 @@ enum EventType {
   FAILED
   RETRYING
   CANCELLED
+  READ      // NEW: Event for tracking in-app feed interaction
+  SEEN      // NEW: Event for tracking in-app feed interaction
 }
+
+
+
