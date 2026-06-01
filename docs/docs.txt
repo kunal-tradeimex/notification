@@ -1,0 +1,33 @@
+📄 Technical Documentation: Notification-as-a-Service (NaaS)
+1. Architectural OverviewThis system is a multi-tenant Notification-as-a-Service (NaaS) engine built with 
+NestJS, Prisma, and PostgreSQL. It allows different software platforms (Tenants) to send notifications to their
+ users (Contacts) via customizable layouts (Templates) securely using cryptographically hashed API keys.
+ 
+2. SOLID Design Principles AppliedSingle Responsibility Principle (SRP): * NotificationController: Handles HTTP 
+requests and formatting only.NotificationService: Orchestrates multi-tenant business logic.TemplateCompilerService: Is 
+isolated to handle text interpolation (Handlebars). Swapping engines will not break database or routing logic.PrismaService: 
+Manages database connections exclusively.
+
+3. API ReferenceTrigger NotificationInbound endpoint used by external tenant systems
+ to dispatch automated messages.URL: /v1/notifications/triggerMethod: POSTHeaders:x-api-key: ntf_live_testkey123456789 
+ 
+ (The plain key string)Content-Type: application/jsonRequest Body:JSON{
+  "workflow": "welcome-email",
+  "recipientId": "user_dev_99",
+  "data": {
+    "name": "Kunal"
+  }
+}
+Success Response (201 Created):JSON{
+  "success": true,
+  "notificationId": "b6a718d7-d0d5-4b06-a612-4c90ee921c5b",
+  "status": "PENDING"
+}
+4. Database Schema Structure (Entities)ModelDescriptionTenantThe corporate customer owning the data space (e.g., Sample Corp).
+ApiKeySecure, unique tokens mapped via SHA-256 hashes to authenticating requests.ContactThe end-user/recipient profile mapping
+ to external platform IDs.TemplateReusable raw markdown syntax structures containing dynamic variables.NotificationImmutable
+  execution logs housing final compiled HTML/Text output data.NotificationEventHistorical audit trail logging delivery 
+  lifecycle milestones (CREATED, SENT, FAILED).5. Error MatrixStatus CodeException TypeScenario401 
+  UnauthorizedUnauthorizedExceptionMissing x-api-key header or hash mismatch in DB.404 Not FoundNotFoundExceptionSpecified 
+  recipientId or workflow template slug does not exist for that tenant.500 Internal ErrorInternalServerErrorExceptionDatabase
+   connectivity losses or structural engine syntax syntax parsing bugs.
