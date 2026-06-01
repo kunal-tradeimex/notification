@@ -1,0 +1,202 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ── TENANTS ──────────────────────────────────────────
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys       ApiKey[]
+  notifications Notification[]
+  templates     Template[]
+  channels      ChannelConfig[]
+  contacts      Contact[]
+
+  @@map("tenants")
+}
+
+// ── API KEYS ──────────────────────────────────────────
+model ApiKey {
+  id         String    @id @default(uuid())
+  tenantId   String
+  name       String
+  keyHash    String    @unique   // always store hashed
+  prefix     String              // shown to user e.g. "ntf_live_"
+  scopes     String[]
+  isActive   Boolean   @default(true)
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// ── CONTACTS ──────────────────────────────────────────
+model Contact {
+  id           String   @id @default(uuid())
+  tenantId     String
+  externalId   String?             // your app's user ID
+  email        String?
+  phone        String?
+  deviceTokens String[]
+  metadata     Json     @default("{}")
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  notifications Notification[]
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId])
+  @@index([email])
+  @@map("contacts")
+}
+
+// ── TEMPLATES ─────────────────────────────────────────
+model Template {
+  id        String      @id @default(uuid())
+  tenantId  String
+  name      String
+  slug      String
+  channel   ChannelType
+  subject   String?
+  body      String                  // Handlebars template
+  variables Json        @default("[]")
+  isActive  Boolean     @default(true)
+  version   Int         @default(1)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  notifications Notification[]
+
+  @@unique([tenantId, slug, channel])
+  @@index([tenantId])
+  @@map("templates")
+}
+
+// ── CHANNEL CONFIG ────────────────────────────────────
+model ChannelConfig {
+  id          String      @id @default(uuid())
+  tenantId    String
+  channel     ChannelType
+  provider    String                // "sendgrid" | "smtp" | "twilio"
+  credentials Json                  // encrypt at app level before saving
+  isActive    Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, channel])
+  @@index([tenantId])
+  @@map("channel_configs")
+}
+
+// ── NOTIFICATIONS ─────────────────────────────────────
+model Notification {
+  id             String             @id @default(uuid())
+  tenantId       String
+  contactId      String?
+  templateId     String?
+  channel        ChannelType
+  status         NotificationStatus @default(PENDING)
+  priority       Priority           @default(NORMAL)
+  to             String
+  subject        String?
+  body           String
+  data           Json               @default("{}")
+  idempotencyKey String?            @unique
+  scheduledAt    DateTime?
+  sentAt         DateTime?
+  deliveredAt    DateTime?
+  failedAt       DateTime?
+  expiresAt      DateTime?
+  retryCount     Int                @default(0)
+  maxRetries     Int                @default(3)
+  errorMessage   String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id])
+  contact  Contact?  @relation(fields: [contactId], references: [id])
+  template Template? @relation(fields: [templateId], references: [id])
+  events   NotificationEvent[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@map("notifications")
+}
+
+// ── NOTIFICATION EVENTS (audit trail) ─────────────────
+model NotificationEvent {
+  id             String    @id @default(uuid())
+  notificationId String
+  event          EventType
+  metadata       Json      @default("{}")
+  occurredAt     DateTime  @default(now())
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@index([notificationId])
+  @@map("notification_events")
+}
+
+// ── ENUMS ─────────────────────────────────────────────
+enum ChannelType {
+  EMAIL
+  SMS
+  PUSH
+  WEBHOOK
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  SENT
+  DELIVERED
+  FAILED
+  CANCELLED
+  SCHEDULED
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  CRITICAL
+}
+
+enum EventType {
+  CREATED
+  QUEUED
+  PROCESSING
+  SENT
+  DELIVERED
+  OPENED
+  CLICKED
+  BOUNCED
+  FAILED
+  RETRYING
+  CANCELLED
+}
