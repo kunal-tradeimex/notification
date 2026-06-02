@@ -14,7 +14,7 @@ export class NotificationController {
     constructor(private readonly notificationService: NotificationService) {}
 
     
-    @Post('trigger')
+    @Post('/trigger')
     @HttpCode(HttpStatus.CREATED)
     async trigger(
         @Headers('x-api-key') apiKey: string,

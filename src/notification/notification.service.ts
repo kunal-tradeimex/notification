@@ -3,11 +3,12 @@ import { PrismaService } from "src/prisma/prisma.service";
 import { TemplateCompilerService } from "./template-compiler.service";
 import * as crypto from 'crypto';
 import { ChannelType, EventType, NotificationStatus } from "@prisma/client";
+import { INotificationService } from "./interfaces/notification-service.interface";
 
 
 
 @Injectable()
-export class NotificationService {
+export class NotificationService implements INotificationService {
 
     constructor(
       private prisma: PrismaService,
