@@ -6,11 +6,15 @@ import { Body,
          Headers, 
          Get,
          Query,
-         UseGuards} from "@nestjs/common";
+         UseGuards,
+         Patch,
+         Param,
+         ParseIntPipe} from "@nestjs/common";
 import { NotificationService } from "./notification.service";
 import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 import { CurrentTenantId } from "src/auth/decorator/current-tenant.decorator";
 import { ApiKeyGuard } from "src/auth/api-key.guard";
+import { ReadAllNotificationDto } from "./dtos/read-all.dto";
 
 
 
@@ -40,6 +44,28 @@ export class NotificationController {
     ) {
 
         return this.notificationService.sendInMapNotification(tenantId,query);
+
+    }
+
+
+    @Patch('/:id/read')
+    async markAsRead (
+        @CurrentTenantId() tenantId: string,
+        @Param('id') notificationId: string
+    ) {
+
+        return this.notificationService.markInAppNotificationAsRead(tenantId,notificationId);
+
+    }
+
+
+    @Post('/read-all')
+    async markAllRead(
+        @CurrentTenantId() tenantId: string,
+        @Body() body: ReadAllNotificationDto
+    ) {
+
+        return this.notificationService.markAllInAppNotificationAsRead(tenantId,body.recipientId);
 
     }
 

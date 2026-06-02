@@ -154,4 +154,132 @@ export class NotificationService implements INotificationService {
 
     }
 
+    async markInAppNotificationAsRead (
+        tenantId: string,
+        notificaitonId: string
+    ) {
+
+        // first check notificationId is belong to the tenant or not
+        const notification = await this.prisma.notification.findFirst({
+            where: {
+                tenantId: tenantId,
+                id: notificaitonId
+            },
+            select: { id: true, isRead: true }
+        });
+
+
+        if (!notification) {
+            throw new UnauthorizedException('Invalid Notification Id');
+        }
+
+       
+        // marked notification if that is not marked as read
+        if (!notification.isRead) {
+            // mutate the notification status flag
+            await this.prisma.notification.update({
+                where: { id: notificaitonId },
+                data: { isRead: true }
+            });
+
+            // append the historical audit log node into the notification event
+            await this.prisma.notificationEvent.create({
+                data: {
+                    notificationId: notificaitonId,
+                    event: EventType.READ,
+                    metadata: {
+                        userAgent: 'client-api',
+                        timestamp: new Date().toISOString()
+                    }
+                }
+            })
+        }
+
+        return {
+            success: true,
+            message: 'Notification Marked as Read Successfully'
+        }
+
+    }
+
+
+    async markAllInAppNotificationAsRead (
+        tenantId: string,
+        recipientId: string
+    ) {
+
+        // map the external recipient profile string to out internal relational Id
+        const contact = await this.prisma.contact.findUnique({
+            where: {
+                tenantId_externalId: {
+                    tenantId: tenantId,
+                    externalId: recipientId
+                }
+            },
+            select: { id: true, isActive: true }
+        });
+
+        
+        if (!contact || !contact.isActive) {
+            throw new NotFoundException(`Recipient contact profile target configuration not found`);
+        }
+
+        
+        const unreadNotification = await this.prisma.notification.findMany({
+            where: {
+                tenantId: tenantId,
+                contactId: contact.id,
+                channel: ChannelType.IN_APP,
+                status: NotificationStatus.SENT,
+                isRead: false
+            },
+            select: { id: true }
+        });
+
+        
+        const notificationIdsToUpdate = unreadNotification.map((n) => n.id);
+
+        
+        if (unreadNotification.length === 0) {
+            return {
+                success: true,
+                message: 'No unread notification found for this recipient',
+                updatedCount: 0
+            }
+        }
+
+        
+        // Instantiate an atomic high-speed single flag to true database tranasaction
+        await this.prisma.$transaction([
+            // Operation 1 : Flip all target records flag to true in bulk
+            this.prisma.notification.updateMany({
+                where: {
+                    id: { in: notificationIdsToUpdate }
+                },
+                data: {
+                    isRead: true
+                }
+            }),
+
+            // Operation 2 : Batch insert matching historic timelines using createMany
+            this.prisma.notificationEvent.createMany({
+                data: notificationIdsToUpdate.map((id) => ({
+                    notificationId: id,
+                    event: EventType.READ,
+                    metadata: {
+                    bulkExecutionPath: true,
+                    timestamp: new Date().toISOString(),
+                    },
+                })),
+            }),
+        ]);
+
+        return {
+            success: true,
+            message: 'All unread notification marked as read successfully',
+            updatedCount: notificationIdsToUpdate.length
+        }
+
+    }
+
 }
