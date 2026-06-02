@@ -4,6 +4,7 @@ import { TemplateCompilerService } from "./template-compiler.service";
 import * as crypto from 'crypto';
 import { ChannelType, EventType, NotificationStatus } from "@prisma/client";
 import { INotificationService } from "./interfaces/notification-service.interface";
+import { NotificationProcessor } from "./notification.processor";
 
 
 
@@ -12,7 +13,9 @@ export class NotificationService implements INotificationService {
 
     constructor(
       private prisma: PrismaService,
-      private compiler: TemplateCompilerService) {}
+      private compiler: TemplateCompilerService,
+      private processor: NotificationProcessor  
+    ) {}
 
 
     async triggerNotification(
@@ -95,6 +98,12 @@ export class NotificationService implements INotificationService {
                 }
             }
         });
+
+        // fire background action async withour using await
+
+        this.processor.processNotification(notification.id).catch((err) => {
+            console.error('Failed to trigger background processing chain',err);
+        })
 
         // Return Data
         return {
