@@ -20,27 +20,10 @@ export class NotificationService implements INotificationService {
 
 
     async triggerNotification(
-        apiKeyHeader: string,
+        tenantId: string,
         bodyData: { workflow: string; recipientId: string; data: Record<string,any> }
     ) {
 
-
-        if(!apiKeyHeader) {
-            throw new UnauthorizedException('API Key is Missing');
-        }
-
-        // Authentication (Hash the inbound API key and find the tenant)
-        const hashedKey = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
-        const apiKeyRecord = await this.prisma.apiKey.findUnique({
-            where: { keyHash: hashedKey },
-            include: { tenant: true }
-        });
-
-        if (!apiKeyRecord || !apiKeyRecord.isActive) {
-            throw new UnauthorizedException('Invalid or inactive api key');
-        }
-
-        const tenantId = apiKeyRecord.tenantId;
 
         // find recipient
         const contact = await this.prisma.contact.findUnique({
@@ -117,35 +100,16 @@ export class NotificationService implements INotificationService {
 
 
     async sendInMapNotification (
-        apiKeyHeader: string,
+        tenantId: string,
         params: GetFeedQueryDto
     ) {
-
-        // check key available or not
-        if (!apiKeyHeader) {
-            throw new UnauthorizedException('API Key is missing')
-        }
-
-        
-        // find the hashed value of the api key and find its record in the DB
-        const hashedKey = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
-        const apiKeyRecord = await this.prisma.apiKey.findUnique({
-            where: { keyHash: hashedKey },
-            include: { tenant: true }
-        });
-
-
-        // check key valid or active 
-        if (!apiKeyRecord || !apiKeyRecord.isActive) {
-            throw new UnauthorizedException('Invalid or Inactive API Key');
-        }
 
 
         // check recepient id is belong to that tenant or not 
         const contact = await this.prisma.contact.findUnique({
             where: {
                 tenantId_externalId: {
-                    tenantId: apiKeyRecord.tenantId,
+                    tenantId: tenantId,
                     externalId: params.recipientId
                 }
             }
@@ -162,7 +126,7 @@ export class NotificationService implements INotificationService {
         
         const notifications = await this.prisma.notification.findMany({
             where: { 
-                tenantId: apiKeyRecord.tenantId,
+                tenantId: tenantId,
                 contactId: contact.id,
                 status: NotificationStatus.SENT,
                 channel: ChannelType.IN_APP,
