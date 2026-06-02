@@ -69,3 +69,7 @@ Input Validation Error Output (400 Bad Request)JSON{
 [SENT]      [FAILED]
 (Success)   (Error written to logs)
 PENDING: Request passes initial safety checks, creates a row inside Notification, spawns a trailing CREATED milestone inside the audit database records, and offloads processing work asynchronously.PROCESSING: The worker takes ownership of the row, reads delivery configuration constraints (ChannelConfig), and constructs target payload instances.SENT: The underlying dispatch provider returns a success handle. The engine updates the entry timestamp metadata markers and tracks a new SENT event entry.FAILED: Any runtime exceptions encountered (e.g., missing credentials, invalid email structures) are caught safely. The tracker updates the target error logs and creates a corresponding FAILED history record.
+
+
+
+

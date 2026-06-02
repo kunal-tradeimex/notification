@@ -3,8 +3,11 @@ import { Body,
          HttpCode, 
          HttpStatus, 
          Post,
-         Headers } from "@nestjs/common";
+         Headers, 
+         Get,
+         Query} from "@nestjs/common";
 import { NotificationService } from "./notification.service";
+import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 
 
 
@@ -22,6 +25,16 @@ export class NotificationController {
     ) {
 
         return this.notificationService.triggerNotification(apiKey,body);
+
+    }
+
+    @Get('/feed')
+    async inAppFeed (
+        @Headers('x-api-key') apiKey: string,
+        @Query() query: GetFeedQueryDto 
+    ) {
+
+        return this.notificationService.sendInMapNotification(apiKey,query);
 
     }
 

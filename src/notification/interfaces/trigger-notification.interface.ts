@@ -12,3 +12,15 @@ export interface TriggerNotificationResponse {
     notificationId: string;
     status: string;
 }
+
+
+export interface InAppNotificationParams {
+    recipientId: string;
+    limit: number;
+    unread: boolean | undefined
+}
+
+export interface InAppNotificationResponse {
+    success: Boolean;
+    notifications: any;
+}

@@ -5,6 +5,7 @@ import * as crypto from 'crypto';
 import { ChannelType, EventType, NotificationStatus } from "@prisma/client";
 import { INotificationService } from "./interfaces/notification-service.interface";
 import { NotificationProcessor } from "./notification.processor";
+import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 
 
 
@@ -111,6 +112,81 @@ export class NotificationService implements INotificationService {
             notificationId: notification.id,
             status: notification.status,
         };
+
+    }
+
+
+    async sendInMapNotification (
+        apiKeyHeader: string,
+        params: GetFeedQueryDto
+    ) {
+
+        // check key available or not
+        if (!apiKeyHeader) {
+            throw new UnauthorizedException('API Key is missing')
+        }
+
+        
+        // find the hashed value of the api key and find its record in the DB
+        const hashedKey = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
+        const apiKeyRecord = await this.prisma.apiKey.findUnique({
+            where: { keyHash: hashedKey },
+            include: { tenant: true }
+        });
+
+
+        // check key valid or active 
+        if (!apiKeyRecord || !apiKeyRecord.isActive) {
+            throw new UnauthorizedException('Invalid or Inactive API Key');
+        }
+
+
+        // check recepient id is belong to that tenant or not 
+        const contact = await this.prisma.contact.findUnique({
+            where: {
+                tenantId_externalId: {
+                    tenantId: apiKeyRecord.tenantId,
+                    externalId: params.recipientId
+                }
+            }
+        });
+
+
+        if (!contact || !contact.isActive) {
+            throw new NotFoundException(`Contact with that id ${params.recipientId} not found`);
+        }
+
+
+        const shouldLookForRead = !params.unreadOnly;
+
+        
+        const notifications = await this.prisma.notification.findMany({
+            where: { 
+                tenantId: apiKeyRecord.tenantId,
+                contactId: contact.id,
+                status: NotificationStatus.SENT,
+                channel: ChannelType.IN_APP,
+                isRead: shouldLookForRead
+             },
+             select:{
+                id: true,
+                subject: true,
+                body: true,
+                isRead: true,
+                createdAt: true
+             },
+            take: params.limit ? Number(params.limit) : 10 ,
+            orderBy: {
+                createdAt: 'desc'
+            }
+        });
+
+
+        return {
+            success: true,
+            count: notifications.length,
+            notifications: notifications
+        }
 
     }
 

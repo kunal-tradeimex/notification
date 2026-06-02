@@ -1,6 +1,8 @@
+import { GetFeedQueryDto } from "../dtos/get-feed.dto";
 import { 
     TriggerNotificationPayload,
-    TriggerNotificationResponse
+    TriggerNotificationResponse,
+    InAppNotificationResponse
  } from "./trigger-notification.interface";
 
  
@@ -10,5 +12,11 @@ import {
         apiKeyHeader: string,
         payload: TriggerNotificationPayload
     ) : Promise<TriggerNotificationResponse>
+
+
+    sendInMapNotification(
+        apiKeyHeader: string,
+        payoad: GetFeedQueryDto
+    ) : Promise<InAppNotificationResponse>
     
  }
