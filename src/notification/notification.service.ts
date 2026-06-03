@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
+import { Inject, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import { PrismaService } from "src/prisma/prisma.service";
 import { TemplateCompilerService } from "./template-compiler.service";
 import * as crypto from 'crypto';
@@ -8,6 +8,8 @@ import { NotificationProcessor } from "./notification.processor";
 import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from "./events/notification-event";
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { REDIS_CLIENT } from "src/redis/redis.module";
+import Redis from "ioredis";
 
 
 @Injectable()
@@ -17,7 +19,8 @@ export class NotificationService implements INotificationService {
       private readonly prisma: PrismaService,
       private readonly compiler: TemplateCompilerService,
       private readonly processor: NotificationProcessor,
-      private readonly eventEmitter: EventEmitter2
+      private readonly eventEmitter: EventEmitter2,
+      @Inject(REDIS_CLIENT) private redis: Redis
     ) {}
 
 
@@ -129,7 +132,7 @@ export class NotificationService implements INotificationService {
     ) {
 
 
-        // check recepient id is belong to that tenant or not 
+        // check recepient id is belong to that tenant or not (multi-tenant safety boundaries checks)
         const contact = await this.prisma.contact.findUnique({
             where: {
                 tenantId_externalId: {
@@ -145,17 +148,52 @@ export class NotificationService implements INotificationService {
         }
 
 
-        const shouldLookForRead = !params.unreadOnly;
+        // Determine the target redis key based on filters criteria
+        const limit = params.limit ? Number(params.limit) : 10;
 
+        // decide the cachekey according to the unreadOnly query filter
+        const cachekey = params.unreadOnly
+             ? `feed:unread:${tenantId}:${params.recipientId}`
+             : `feed:unread:${tenantId}:${params.recipientId}`;
+
+
+        // end offset for redis zest pagination (0-Indexed inclusive bounds)
+        const endOffset = limit-1;
+
+        try {
+            // first try the high speed and efficient redis search
+            const cacheFeed = await this.redis.zrevrange(cachekey,0,endOffset);
+
+            // check cache hit or miss
+            if (cacheFeed && cacheFeed.length > 0) {
+                console.log(`Cache HIT [${cachekey}] - Fast streaming cache entries`);
+                return {
+                    success: true,
+                    source: 'cache',
+                    count: cacheFeed.length,
+                    notifications: cacheFeed.map((item) => JSON.parse(item))
+                }
+            }
+        } catch (cacheError) {
+            console.log(`Cache isolation read failure, falling back to db:`,cacheError);
+        }
+
+
+        // Database fallback pathway when cache miss
+        const whereClause: any = {
+            tenantId: tenantId,
+            contact: contact.id,
+            status: NotificationStatus.SENT,
+            channel: ChannelType.IN_APP
+        };
+
+
+        if (params.unreadOnly) {
+            whereClause.isRead = false;
+        }
         
         const notifications = await this.prisma.notification.findMany({
-            where: { 
-                tenantId: tenantId,
-                contactId: contact.id,
-                status: NotificationStatus.SENT,
-                channel: ChannelType.IN_APP,
-                isRead: shouldLookForRead
-             },
+            where: whereClause,
              select:{
                 id: true,
                 subject: true,
@@ -163,15 +201,31 @@ export class NotificationService implements INotificationService {
                 isRead: true,
                 createdAt: true
              },
-            take: params.limit ? Number(params.limit) : 10 ,
+            take: limit,
             orderBy: {
                 createdAt: 'desc'
             }
         });
 
+        // cache warmup pipeline to fed the cache with the freq data
+        if (notifications.length > 0) {
+            try {
+                const pipeline = this.redis.pipeline();
+                notifications.forEach((notif) => {
+                    const score = new Date(notif.createdAt).getTime();
+                    pipeline.zadd(cachekey,score,JSON.stringify(notif));
+                });
+                pipeline.expire(cachekey,604800);
+                await pipeline.exec();
+                console.log(`Cached feed warmed up with the ${notifications.length} entries`)
+            } catch (warmupErr) {
+                console.error('Cache Warmup skipped',warmupErr);
+            }
+        }
 
         return {
             success: true,
+            source: 'database',
             count: notifications.length,
             notifications: notifications
         }

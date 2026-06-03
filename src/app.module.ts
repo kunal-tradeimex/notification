@@ -3,11 +3,13 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { NotificationModule } from './notification/notification.module';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
     EventEmitterModule.forRoot(),
-    NotificationModule
+    NotificationModule,
+    RedisModule
   ],
   controllers: [AppController],
   providers: [AppService],

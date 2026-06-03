@@ -11,6 +11,9 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import * as crypto from 'crypto';
 import { OnEvent } from '@nestjs/event-emitter';
 import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from './events/notification-event';
+import { Inject } from '@nestjs/common';
+import { REDIS_CLIENT } from 'src/redis/redis.module';
+import Redis from 'ioredis';
 
 // confiuration for the websocket to connect here and config the cors
 
@@ -28,7 +31,10 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
     @WebSocketServer()
     server!: Server;
 
-    constructor(private readonly prisma: PrismaService) {
+    constructor(
+        private readonly prisma: PrismaService,
+        @Inject(REDIS_CLIENT) private readonly redis: Redis
+    ) {
         console.log("Websocket initialized")
     }
 
@@ -94,10 +100,51 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
 
     // Listener for the event
     @OnEvent(NOTIFICATION_CREATED_EVENT)
-    handleLiveNotificationPush(payload: NotificationCreatedEvent) {
+    async handleLiveNotificationPush(payload: NotificationCreatedEvent) {
         const targetRoom = `${payload.tenantId}:${payload.recipientId}`;
 
+        // Deliver the notification instantly via the websocket pipe
         this.server.to(targetRoom).emit('notification_received',payload.notification);
+
+        try {
+
+            // Surgical redis cache write-through
+            // Define the Dynamic keys one to store the all notitifcation and one which store the unread message for easy filtration
+            const cacheKeyAll = `feed:read:${payload.tenantId}:${payload.recipientId}`;
+            const cacheKeyUnread = `feed:all:${payload.tenantId}:${payload.recipientId}`;
+
+            // use the redis pipeline for the batch write functionalities together
+            const pipeline = this.redis.pipeline();
+
+            // check created At time already exist
+            if (!payload.notification?.createdAt) {
+                console.error('Notification missing createdAt');
+                return ;
+            }
+
+            const score = new Date(payload.notification?.createdAt).getTime();
+            const stringifiedData = JSON.stringify(payload.notification);
+
+            // ZADD adds the single notification into the sorted set timeline instantly
+            pipeline.zadd(cacheKeyAll,score,stringifiedData);
+            pipeline.zadd(cacheKeyUnread,score,stringifiedData);
+
+            // Mitigate memory leak: Limit total cached history rows per user to 100 entries max
+            // Trims out old, cold data past index 100 in logarithmic time complexity
+            pipeline.zremrangebyrank(cacheKeyAll,0,-101);
+            pipeline.zremrangebyrank(cacheKeyUnread,0,-101);
+
+            // set the Rolling for the 7-days TTL  
+            pipeline.expire(cacheKeyAll,604800);
+            pipeline.expire(cacheKeyUnread,604800);
+
+            await pipeline.exec();
+
+            console.log(`⚡ Cached notification surgically inside Redis Sorted Set: ${payload.notification.id}`);
+
+        } catch (error) {
+            console.error('Cache Ingestion Pipeline failure:',error);
+        }
 
         console.log(`Live Broadcast pushed to room [${targetRoom}] via web socket`);
 
