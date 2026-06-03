@@ -6,16 +6,18 @@ import { ChannelType, EventType, NotificationStatus } from "@prisma/client";
 import { INotificationService } from "./interfaces/notification-service.interface";
 import { NotificationProcessor } from "./notification.processor";
 import { GetFeedQueryDto } from "./dtos/get-feed.dto";
-
+import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from "./events/notification-event";
+import { EventEmitter2 } from '@nestjs/event-emitter';
 
 
 @Injectable()
 export class NotificationService implements INotificationService {
 
     constructor(
-      private prisma: PrismaService,
-      private compiler: TemplateCompilerService,
-      private processor: NotificationProcessor  
+      private readonly prisma: PrismaService,
+      private readonly compiler: TemplateCompilerService,
+      private readonly processor: NotificationProcessor,
+      private readonly eventEmitter: EventEmitter2
     ) {}
 
 
@@ -53,7 +55,7 @@ export class NotificationService implements INotificationService {
 
         // compile template using our detached compiler enginer
         const finalSubject = template.subject
-              ? this.compiler.compile(template.body,bodyData.data)
+              ? this.compiler.compile(template.subject,bodyData.data)
               : null;
 
         const finalBody = this.compiler.compile(template.body,bodyData.data);
@@ -62,6 +64,7 @@ export class NotificationService implements INotificationService {
         
         if (template.channel === ChannelType.EMAIL) sendToDestinaton = contact.email || '';
         if (template.channel === ChannelType.SMS) sendToDestinaton = contact.phone || '';
+        if (template.channel === ChannelType.IN_APP) sendToDestinaton = bodyData.recipientId || '';
 
         // save record as pending into the db as pending
         const notification = await this.prisma.notification.create({
@@ -85,9 +88,30 @@ export class NotificationService implements INotificationService {
 
         // fire background action async withour using await
 
-        this.processor.processNotification(notification.id).catch((err) => {
-            console.error('Failed to trigger background processing chain',err);
-        })
+        this.processor.processNotification(notification.id)
+            .then(async (processedNotification) => {
+
+                if (template.channel === ChannelType.IN_APP) {
+                    const liveStreamPayload: NotificationCreatedEvent = {
+                        tenantId: tenantId,
+                        recipientId: bodyData.recipientId,
+                        notification: {
+                            id: notification.id,
+                            subject: finalSubject || '',
+                            body: finalBody,
+                            createdAt: notification.createdAt,
+                            isRead: false
+                        }
+                    }
+
+                    // Broadcast this event inside our server's RAM pool so our Gateway can hear it
+                    this.eventEmitter.emit(NOTIFICATION_CREATED_EVENT,liveStreamPayload);
+                }
+
+            })
+            .catch((err) => {
+                console.error('Failed to trigger background processing chain',err);
+            })
 
         // Return Data
         return {

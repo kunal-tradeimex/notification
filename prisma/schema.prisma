@@ -214,3 +214,6 @@ enum EventType {
 
 
 
+
+
+// in notification @@index([tenantId, contactId, channel, status, isRead, createdAt])

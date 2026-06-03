@@ -67,10 +67,13 @@ export class NotificationProcessor {
                 credentials,
             });
 
+            
+            let updatedNotification: any;
+
 
             // If successfull, update the audit table
             if (result.success) {
-                await this.prisma.notification.update({
+                updatedNotification = await this.prisma.notification.update({
                     where: { id: notificationId },
                     data: {
                         status: NotificationStatus.SENT,
@@ -87,6 +90,8 @@ export class NotificationProcessor {
                     metadata: { providerMessageId: result.messageId }
                 }
             });
+
+            return updatedNotification;
 
 
         } catch (error: any) {
