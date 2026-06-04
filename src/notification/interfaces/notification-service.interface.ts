@@ -14,7 +14,7 @@ import {
     ) : Promise<TriggerNotificationResponse>
 
 
-    sendInMapNotification(
+    sendInAppNotification(
         apiKeyHeader: string,
         payoad: GetFeedQueryDto
     ) : Promise<InAppNotificationResponse>

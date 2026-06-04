@@ -11,9 +11,10 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import * as crypto from 'crypto';
 import { OnEvent } from '@nestjs/event-emitter';
 import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from './events/notification-event';
-import { Inject } from '@nestjs/common';
-import { REDIS_CLIENT } from 'src/redis/redis.module';
+import { Inject, OnModuleInit } from '@nestjs/common';
+import { REDIS_CLIENT, REDIS_SUBSCRIBER } from 'src/redis/redis.module';
 import Redis from 'ioredis';
+import { CacheKeyFactory, REDIS_CHANNELS, WS_EVENTS } from './constants/notification.constants';
 
 // confiuration for the websocket to connect here and config the cors
 
@@ -33,9 +34,80 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
 
     constructor(
         private readonly prisma: PrismaService,
-        @Inject(REDIS_CLIENT) private readonly redis: Redis
+        @Inject(REDIS_CLIENT) private readonly redis: Redis,
+        @Inject(REDIS_SUBSCRIBER) private readonly redisSubscriber: Redis
     ) {
         console.log("Websocket initialized")
+    }
+
+
+    // Initialize cluster subscription on app start so web socket also get events from the redis
+    async onModuleInit() {
+        // HORIZONTAL SCALING BACKBONE: REDIS PUB/SUB LISTENER
+        // LOCK REASON: A Redis connection cannot run data commands (ZADD, GET, SET) 
+        // once it enters SUBSCRIBE mode. We use a dedicated client ('redisSubscriber') 
+        // to open a persistent, long-lived TCP stream listening to the cluster channel.
+        // This allows any app instance in our cloud to catch and stream live alerts 
+        // to active UI rooms, even if the notification was processed by a completely 
+        // different server node.
+        await this.redisSubscriber.subscribe(REDIS_CHANNELS.PLATFORM_NOTIFICATIONS);
+        console.log('Gateway Cluster listening actively on channel [platform:notifications]');
+
+        // intercept inbound events from the redis network core
+        this.redisSubscriber.on('message', async (channel: string, message: string) => {
+            if (channel === REDIS_CHANNELS.PLATFORM_NOTIFICATIONS) {
+                try {
+                    const payload = JSON.parse(message);
+                    const targetRoom = `${payload.tenantId}:${payload.recipientId}`;
+
+                    // Direct Persistent Socket Stream Delievery
+                    // If the user isn't connected to that specific server node, socker.io handles it
+                    this.server.to(targetRoom).emit(WS_EVENTS.NOTIFICATION_RECEIVED,payload.notification);
+                    console.log(`Node caught network event -> streamed to client cell room: [${targetRoom}]`);
+
+                    // perform the write-thrugh caching concurrently right here
+                    const score = new Date(payload.notification.createdAt).getTime();
+                    const stringifiedData = JSON.stringify(payload.notification);
+
+                    // define the cahce key for storing all notifications and unread notification
+                    const cacheKeyAll = CacheKeyFactory.getAllFeedKey(payload.tenantId,payload.recipientId);
+                    const cacheKeyUnread = CacheKeyFactory.getAllFeedKey(payload.tenantId,payload.recipientId);
+
+                    // use regular redis client pipeline
+                    const pipeline = this.redis.pipeline();
+
+
+                    // add the data in the pipe line via zadd to use the data to store in the zset
+                    pipeline.zadd(cacheKeyAll,score,stringifiedData);
+                    pipeline.zadd(cacheKeyUnread,score,stringifiedData);
+
+                    // remove the data from the cache which is too old only use last 100 notification
+                    pipeline.zremrangebyrank(cacheKeyAll,0,-101);
+                    pipeline.zremrangebyrank(cacheKeyUnread,0,-101);
+
+                    // define the ttl for the value to expire the value after sometime
+                    pipeline.expire(cacheKeyAll,604800);
+                    pipeline.expire(cacheKeyUnread,604800);
+
+                    // execute the pipeline
+                    const result = await pipeline.exec();
+
+                    console.log('Pipeline result:',result);
+
+                    console.log(
+                        'Feed:All',
+                        await this.redis.zrange(cacheKeyAll,0,-1,'WITHSCORES')
+                    );
+
+                    console.log(
+                        'Feed Unread:',
+                        await this.redis.zrange(cacheKeyUnread,0,-1,'WITHSCORES')
+                    );
+                } catch (error) {
+                    console.error('Node failed to deserialize cluster event payload:',error);
+                }
+            }
+        })
     }
 
     async handleConnection(client: Socket) {
@@ -99,54 +171,55 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
 
 
     // Listener for the event
-    @OnEvent(NOTIFICATION_CREATED_EVENT)
-    async handleLiveNotificationPush(payload: NotificationCreatedEvent) {
-        const targetRoom = `${payload.tenantId}:${payload.recipientId}`;
+    // Old code without redis pub/sub work when only one instance of server is used 
+    // @OnEvent(NOTIFICATION_CREATED_EVENT)
+    // async handleLiveNotificationPush(payload: NotificationCreatedEvent) {
+    //     const targetRoom = `${payload.tenantId}:${payload.recipientId}`;
 
-        // Deliver the notification instantly via the websocket pipe
-        this.server.to(targetRoom).emit('notification_received',payload.notification);
+    //     // Deliver the notification instantly via the websocket pipe
+    //     this.server.to(targetRoom).emit('notification_received',payload.notification);
 
-        try {
+    //     try {
 
-            // Surgical redis cache write-through
-            // Define the Dynamic keys one to store the all notitifcation and one which store the unread message for easy filtration
-            const cacheKeyAll = `feed:read:${payload.tenantId}:${payload.recipientId}`;
-            const cacheKeyUnread = `feed:all:${payload.tenantId}:${payload.recipientId}`;
+    //         // Surgical redis cache write-through
+    //         // Define the Dynamic keys one to store the all notitifcation and one which store the unread message for easy filtration
+    //         const cacheKeyAll = `feed:read:${payload.tenantId}:${payload.recipientId}`;
+    //         const cacheKeyUnread = `feed:all:${payload.tenantId}:${payload.recipientId}`;
 
-            // use the redis pipeline for the batch write functionalities together
-            const pipeline = this.redis.pipeline();
+    //         // use the redis pipeline for the batch write functionalities together
+    //         const pipeline = this.redis.pipeline();
 
-            // check created At time already exist
-            if (!payload.notification?.createdAt) {
-                console.error('Notification missing createdAt');
-                return ;
-            }
+    //         // check created At time already exist
+    //         if (!payload.notification?.createdAt) {
+    //             console.error('Notification missing createdAt');
+    //             return ;
+    //         }
 
-            const score = new Date(payload.notification?.createdAt).getTime();
-            const stringifiedData = JSON.stringify(payload.notification);
+    //         const score = new Date(payload.notification?.createdAt).getTime();
+    //         const stringifiedData = JSON.stringify(payload.notification);
 
-            // ZADD adds the single notification into the sorted set timeline instantly
-            pipeline.zadd(cacheKeyAll,score,stringifiedData);
-            pipeline.zadd(cacheKeyUnread,score,stringifiedData);
+    //         // ZADD adds the single notification into the sorted set timeline instantly
+    //         pipeline.zadd(cacheKeyAll,score,stringifiedData);
+    //         pipeline.zadd(cacheKeyUnread,score,stringifiedData);
 
-            // Mitigate memory leak: Limit total cached history rows per user to 100 entries max
-            // Trims out old, cold data past index 100 in logarithmic time complexity
-            pipeline.zremrangebyrank(cacheKeyAll,0,-101);
-            pipeline.zremrangebyrank(cacheKeyUnread,0,-101);
+    //         // Mitigate memory leak: Limit total cached history rows per user to 100 entries max
+    //         // Trims out old, cold data past index 100 in logarithmic time complexity
+    //         pipeline.zremrangebyrank(cacheKeyAll,0,-101);
+    //         pipeline.zremrangebyrank(cacheKeyUnread,0,-101);
 
-            // set the Rolling for the 7-days TTL  
-            pipeline.expire(cacheKeyAll,604800);
-            pipeline.expire(cacheKeyUnread,604800);
+    //         // set the Rolling for the 7-days TTL  
+    //         pipeline.expire(cacheKeyAll,604800);
+    //         pipeline.expire(cacheKeyUnread,604800);
 
-            await pipeline.exec();
+    //         await pipeline.exec();
 
-            console.log(`⚡ Cached notification surgically inside Redis Sorted Set: ${payload.notification.id}`);
+    //         console.log(`⚡ Cached notification surgically inside Redis Sorted Set: ${payload.notification.id}`);
 
-        } catch (error) {
-            console.error('Cache Ingestion Pipeline failure:',error);
-        }
+    //     } catch (error) {
+    //         console.error('Cache Ingestion Pipeline failure:',error);
+    //     }
 
-        console.log(`Live Broadcast pushed to room [${targetRoom}] via web socket`);
+    //     console.log(`Live Broadcast pushed to room [${targetRoom}] via web socket`);
 
-    }
+    // }
 }

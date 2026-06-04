@@ -10,6 +10,7 @@ import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from "./events/n
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { REDIS_CLIENT } from "src/redis/redis.module";
 import Redis from "ioredis";
+import { CacheKeyFactory, REDIS_CHANNELS } from "./constants/notification.constants";
 
 
 @Injectable()
@@ -20,6 +21,10 @@ export class NotificationService implements INotificationService {
       private readonly compiler: TemplateCompilerService,
       private readonly processor: NotificationProcessor,
       private readonly eventEmitter: EventEmitter2,
+
+      // That redis client injection is work like both redis client and as well as publisher
+      // because client and publisher both are non-blocking operation unlike subscriber which is blocking
+      // that why we create a seprate client for the subscriber in redis module 
       @Inject(REDIS_CLIENT) private redis: Redis
     ) {}
 
@@ -108,7 +113,20 @@ export class NotificationService implements INotificationService {
                     }
 
                     // Broadcast this event inside our server's RAM pool so our Gateway can hear it
-                    this.eventEmitter.emit(NOTIFICATION_CREATED_EVENT,liveStreamPayload);
+                    // this.eventEmitter.emit(NOTIFICATION_CREATED_EVENT,liveStreamPayload); // old code for single server instance
+
+                    // if we want to use mutiple server instance then emitting event in the Server's RAM pool is
+                    // not working well because it can be a possiblitiy server websocket connection is on server A
+                    // and load balance redirect the request of that service to the server B and if emitted event 
+                    // present in server B how we send the real time update to the user browser so use redis pub/sub here
+
+                    await this.redis.publish(
+                        REDIS_CHANNELS.PLATFORM_NOTIFICATIONS,
+                        JSON.stringify(liveStreamPayload)
+                    );
+
+                    console.log(`Broadcast event successfully injected into the global Pub/Sub`);
+
                 }
 
             })
@@ -126,7 +144,7 @@ export class NotificationService implements INotificationService {
     }
 
 
-    async sendInMapNotification (
+    async sendInAppNotification (
         tenantId: string,
         params: GetFeedQueryDto
     ) {
@@ -153,8 +171,8 @@ export class NotificationService implements INotificationService {
 
         // decide the cachekey according to the unreadOnly query filter
         const cachekey = params.unreadOnly
-             ? `feed:unread:${tenantId}:${params.recipientId}`
-             : `feed:unread:${tenantId}:${params.recipientId}`;
+             ? CacheKeyFactory.getUnreadFeedKey(tenantId,params.recipientId)
+             : CacheKeyFactory.getAllFeedKey(tenantId,params.recipientId);
 
 
         // end offset for redis zest pagination (0-Indexed inclusive bounds)

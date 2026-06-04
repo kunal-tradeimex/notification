@@ -43,7 +43,7 @@ export class NotificationController {
         @Query() query: GetFeedQueryDto 
     ) {
 
-        return this.notificationService.sendInMapNotification(tenantId,query);
+        return this.notificationService.sendInAppNotification(tenantId,query);
 
     }
 
