@@ -15,6 +15,7 @@ import { Inject, OnModuleInit } from '@nestjs/common';
 import { REDIS_CLIENT, REDIS_SUBSCRIBER } from 'src/redis/redis.module';
 import Redis from 'ioredis';
 import { CacheKeyFactory, REDIS_CHANNELS, WS_EVENTS } from './constants/notification.constants';
+import jwt from 'jsonwebtoken';
 
 // confiuration for the websocket to connect here and config the cors
 
@@ -113,49 +114,74 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
     async handleConnection(client: Socket) {
         console.log(`🔌 Inbound connection attempt detected. Socket ID: ${client.id}`);
         try {
-            // pull credentials from the initial handshake data to validate the tenant and recipient
-            const apiKeyHeader = client.handshake.headers['x-api-key'] as string;
-            const recipientId = (
-                client.handshake.query.recipientId ||
-                client.handshake.query.recipientid ||
-                client.handshake.headers['recipientid']
-             ) as string;
+            // pull credentials from the initial handshake data to validate the tenant and recipient (old code verify connection via api-key send via user browser)
+            // const apiKeyHeader = client.handshake.headers['x-api-key'] as string;
+            // const recipientId = (
+            //     client.handshake.query.recipientId ||
+            //     client.handshake.query.recipientid ||
+            //     client.handshake.headers['recipientid']
+            //  ) as string;
 
-            if (!apiKeyHeader || !recipientId) {
-                console.log('❌ Connection rejected: Missing credentials or recipient identifier.');
-                client.disconnect(true);
+            // if (!apiKeyHeader || !recipientId) {
+            //     console.log('❌ Connection rejected: Missing credentials or recipient identifier.');
+            //     client.disconnect(true);
+            //     return ;
+            // }
+
+            // // Authenticate the connection using the secure hashing arch.
+            // const hashedKey = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
+            // const apiKeyRecord = await this.prisma.apiKey.findUnique({
+            //     where: { keyHash: hashedKey },
+            //     select: { tenantId: true, isActive: true }
+            // });
+
+            // if (!apiKeyRecord || !apiKeyRecord.isActive) {
+            //     client.disconnect(true);
+            //     return ;
+            // }
+
+            // const contact = await this.prisma.contact.findUnique({
+            //     where: {
+            //         tenantId_externalId: {
+            //             tenantId: apiKeyRecord.tenantId,
+            //             externalId: recipientId
+            //         }
+            //     }
+            // });
+
+
+            // if (!contact || !contact.isActive) {
+            //     client.disconnect(true);
+            //     return ;
+            // }
+
+
+            // New and Optimized code verify web socket connection with the help of two way handshake server-to-server bw naas and user backend
+
+            // console.log("Client Handshake data is:",client.handshake.headers)
+            const token = client.handshake.headers.token as string;
+
+            if (!token) {
+                console.log('Connection Dropped: Missing token in query');
+                client.disconnect();
+                return;
+            }
+
+            // verify the token and extract the decoded payload
+            const secret = process.env.JWT_SECRET_IN_APP_NOTIY;
+
+            if (!secret) {
+                console.log('Secret key is missing');
                 return ;
             }
 
-            // Authenticate the connection using the secure hashing arch.
-            const hashedKey = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
-            const apiKeyRecord = await this.prisma.apiKey.findUnique({
-                where: { keyHash: hashedKey },
-                select: { tenantId: true, isActive: true }
-            });
-
-            if (!apiKeyRecord || !apiKeyRecord.isActive) {
-                client.disconnect(true);
-                return ;
-            }
-
-            const contact = await this.prisma.contact.findUnique({
-                where: {
-                    tenantId_externalId: {
-                        tenantId: apiKeyRecord.tenantId,
-                        externalId: recipientId
-                    }
-                }
-            });
+            const decoded = jwt.verify(token,secret) as { tenantId: string, recipientId: string };
 
 
-            if (!contact || !contact.isActive) {
-                client.disconnect(true);
-                return ;
-            }
+            const { tenantId,recipientId } = decoded;
 
-            // create the private secure room
-            const privateRoomId = `${apiKeyRecord.tenantId}:${recipientId}`;
+            // create the private secure room with the help of decoded from the Jwt
+            const privateRoomId = `${tenantId}:${recipientId}`;
             await client.join(privateRoomId);
 
             console.log(`Client connected securely to stream room: [${privateRoomId}]`);

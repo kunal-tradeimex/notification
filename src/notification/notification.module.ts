@@ -6,12 +6,15 @@ import { PrismaService } from "src/prisma/prisma.service";
 import { NotificationProcessor } from "./notification.processor";
 import { ProvideFactory } from "./provider/provider.factory";
 import { NotificationGateway } from "./notification.gateway";
+import { RealTimeAuthController } from "./realtime-notification.controller";
+import { RealtimeAuthService } from "./realtime-notification.service";
 
 
 
 @Module({
     controllers: [
-        NotificationController
+        NotificationController,
+        RealTimeAuthController
     ],
     providers: [
         NotificationService, 
@@ -19,7 +22,8 @@ import { NotificationGateway } from "./notification.gateway";
         PrismaService,
         NotificationProcessor,
         ProvideFactory,
-        NotificationGateway
+        NotificationGateway,
+        RealtimeAuthService
     ]
 })
 export class NotificationModule {};
