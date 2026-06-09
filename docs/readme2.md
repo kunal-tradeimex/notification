@@ -1,6 +1,6 @@
 # NaaS — Notification-as-a-Service
 
-A multi-tenant notification platform that lets any client application send **email, SMS, push, and in-app notifications** through a single API. Built to understand how real notification infrastructure works at scale — async processing, real-time delivery, high-performance caching, and horizontally scalable WebSocket broadcasting.
+A multi-tenant notification platform that lets any client application send **email, SMS, push, and in-app notifications** through a single API. Built to understand how real notification infrastructure works at scale — async processing, real-time delivery, high-performance caching, horizontally scalable WebSocket broadcasting, and distributed rate limiting.
 
 > This is a solo project. Built from scratch, no boilerplate.
 
@@ -13,6 +13,7 @@ A multi-tenant notification platform that lets any client application send **ema
 - In-app notifications stream to the browser **in real-time over WebSockets**
 - A Redis-backed feed returns notification history in under 2ms
 - **WebSocket broadcasting works across multiple server instances** via Redis Pub/Sub
+- **Per-tenant rate limiting enforced across all instances** via Redis sliding window
 - Every notification has a full **audit trail** of lifecycle events
 
 ---
@@ -28,6 +29,7 @@ A multi-tenant notification platform that lets any client application send **ema
 | Pub/Sub | Redis Pub/Sub (dedicated subscriber connection) |
 | Real-time | Socket.IO |
 | Auth | SHA-256 API key hashing + signed JWT for WebSocket |
+| Rate Limiting | Redis Sorted Set sliding window, per tenant |
 
 ---
 
@@ -86,6 +88,8 @@ PORT=3003 npm run start:dev
 
 Connect a WebSocket client to port `3001`, send a trigger request to port `3002`, and observe the notification arrive on the `3001` socket. That proves Redis Pub/Sub is working across instances.
 
+To verify distributed rate limiting, hammer any instance with requests beyond the configured limit — the 429 will fire regardless of which instance receives each individual request, because the counter lives in shared Redis.
+
 ---
 
 ## Project Structure
@@ -94,9 +98,11 @@ Connect a WebSocket client to port `3001`, send a trigger request to port `3002`
 src/
 ├── notification/
 │   ├── constants/
-│   │   └── notification.constants.ts   # Redis channel names, WS events, cache key factory
+│   │   └── notification.constants.ts   # Redis channel names, WS events, cache key factory, rate limit config
 │   ├── events/
 │   │   └── notification-event.ts       # Typed event payload definitions
+│   ├── guards/
+│   │   └── distributed-redis-limiter.guard.ts  # Sliding window rate limiter
 │   ├── notification.gateway.ts         # WebSocket gateway + Redis Pub/Sub subscriber
 │   ├── notification.service.ts         # Trigger logic + Redis publisher
 │   └── notification.controller.ts      # HTTP route handlers
@@ -114,6 +120,13 @@ src/
 
 ```
 POST /v1/notifications/trigger
+        │
+        ├── 0. DistributedRedisLimiterGuard
+        │       ├── hash API key → look up tenantId (Redis cache → DB fallback)
+        │       ├── ZREMRANGEBYSCORE: evict stale entries from sliding window
+        │       ├── ZADD: record this request with timestamp score
+        │       ├── ZCARD: count requests in window
+        │       └── if count > MAX_REQUESTS → 429 Too Many Requests
         │
         ├── 1. Hash API key → resolve tenant
         ├── 2. Look up contact by externalId
@@ -166,6 +179,16 @@ redisSubscriber  → dedicated to subscribe mode only
 
 A connection in subscribe mode is blocked — Redis won't let it run any other commands. So the subscriber is always a dedicated separate client.
 
+### Why Redis sliding window for rate limiting?
+
+A fixed window counter (`INCR` + `EXPIRE`) resets at a hard clock boundary. A tenant can drain their full quota at second 59 of a window and then immediately fire again at second 0 of the next — effectively doubling throughput at every boundary.
+
+A sliding window stores each request as a timestamped entry in a Redis Sorted Set. On every request it evicts entries older than the window and counts what remains. There is no reset boundary — the window rolls continuously with real time.
+
+Because the counter lives in Redis (not instance memory), it is correctly accumulated across all horizontally scaled server instances. A tenant splitting 100 requests across three servers still sees a single counter.
+
+The guard is intentionally **fail-open**: if Redis is temporarily unavailable, requests pass through rather than taking down the API. Authentication still rejects invalid keys. Rate limiting is a protection layer, not an authentication layer.
+
 ### WebSocket auth
 
 Exposing an API key to the browser would be a security hole. Instead:
@@ -188,6 +211,17 @@ All requests require:
 x-api-key: your_raw_api_key
 ```
 
+Requests exceeding the per-tenant rate limit receive:
+
+```
+HTTP 429 Too Many Requests
+{
+  "statusCode": 429,
+  "error": "Too many Request",
+  "message": "Rate Limit threshold exceeded. Dynamic shield blocked request"
+}
+```
+
 ---
 
 ### Notifications
@@ -199,6 +233,8 @@ POST /v1/notifications/trigger
 ```
 
 Compiles a template, creates a notification record, and dispatches it asynchronously. Returns immediately — processing happens in the background.
+
+**Guards:** `DistributedRedisLimiterGuard` — enforces per-tenant sliding window rate limit before any business logic runs.
 
 **Request body**
 
@@ -234,6 +270,7 @@ Compiles a template, creates a notification record, and dispatches it asynchrono
 | `401` | Invalid or missing API key. |
 | `404` | No contact found for this `recipientId`. |
 | `404` | No active template found for this `workflow`. |
+| `429` | Per-tenant rate limit exceeded. |
 
 ---
 
@@ -354,18 +391,32 @@ Full schema lives in `prisma/schema.prisma`. Key models:
 
 ---
 
+## Redis Key Reference
+
+| Key Pattern | Type | TTL | Purpose |
+|---|---|---|---|
+| `feed:all:{tenantId}:{userId}` | ZSET | 7 days rolling | Full notification feed per user. |
+| `feed:unread:{tenantId}:{userId}` | ZSET | 7 days rolling | Unread-only feed for badge counts. |
+| `apikey:{keyHash}` | String | 24h | Maps API key hash → tenantId, avoids DB lookup on hot paths. |
+| `ratelimit:{tenantId}` | ZSET | Rolling (window size) | Sliding window request log per tenant. |
+
+---
+
 ## What's Next
 
 The current implementation is architected correctly for the core flow. These are the gaps to close before production use:
 
 **Job Queue (BullMQ)**
-Background processing is a forked async function right now. Replacing it with BullMQ adds proper retries, concurrency limits, per-tenant rate limiting, and a dead-letter queue for permanently failed jobs. The async architecture is already in place — this is a drop-in upgrade.
+Background processing is a forked async function right now. Replacing it with BullMQ adds proper retries, concurrency limits, per-tenant rate limiting at the queue level, and a dead-letter queue for permanently failed jobs. The async architecture is already in place — this is a drop-in upgrade.
 
 **Real Provider Adapters**
 Dispatch is currently simulated with a timeout. The `ChannelConfig` model already stores per-tenant credentials for SendGrid, Twilio, and FCM. Plugging in real adapters is the next step.
 
-**Per-Tenant Rate Limiting**
-No rate limiting exists on API endpoints today. Production would need per-tenant request quotas tracked in Redis counters against the API key.
+**API key revocation cache invalidation**
+When an API key is revoked, the `apikey:{keyHash}` cache entry survives for up to 24 hours. The downstream auth interceptor will still reject the revoked key, but the rate limit counter will continue attributing requests to the old tenant until the TTL expires. The fix is to `DEL apikey:{keyHash}` in Redis at the moment of revocation.
+
+**Configurable rate limits per tenant**
+`RATE_LIMIT_CONFIG` is currently a global constant. A future version could store per-tenant overrides in PostgreSQL (or Redis itself), fetched and cached alongside the tenant ID lookup so high-volume tenants can be given higher limits without a code change.
 
 ---
 
@@ -377,6 +428,9 @@ No rate limiting exists on API endpoints today. Production would need per-tenant
 - Why a Redis subscriber connection must be dedicated and separate — a subscribed connection is blocked from all other commands
 - How WebSocket room isolation works and why JWTs are the right auth mechanism for real-time connections vs passing API keys to the browser
 - The nuke-and-rebuild invalidation pattern for bulk operations — cheaper than surgically updating dozens of individual cache entries
+- Why a sliding window rate limiter beats a fixed window counter — no boundary spike, no artificial doubling of quota at the reset moment
+- How to implement distributed rate limiting correctly — storing state in Redis rather than instance memory so the limit holds across all scaled servers
+- The fail-open pattern for infrastructure guards — rate limiting should protect the system, not become a single point of failure
 
 ---
 

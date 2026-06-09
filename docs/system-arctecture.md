@@ -25,10 +25,11 @@
 8. [Cache Layer Design](#8-cache-layer-design)
 9. [WebSocket Gateway Internals](#9-websocket-gateway-internals)
 10. [Security Architecture](#10-security-architecture)
-11. [Constants & Key Management](#11-constants--key-management)
-12. [Known Issues & Bugs](#12-known-issues--bugs)
-13. [How to Extend This Documentation](#13-how-to-extend-this-documentation)
-14. [Implementation Log](#14-implementation-log)
+11. [Rate Limiting](#11-rate-limiting)
+12. [Constants & Key Management](#12-constants--key-management)
+13. [Known Issues & Bugs](#13-known-issues--bugs)
+14. [How to Extend This Documentation](#14-how-to-extend-this-documentation)
+15. [Implementation Log](#15-implementation-log)
 
 ---
 
@@ -39,6 +40,12 @@
 ```
 ┌────────────────────────────────────────┐
 │       Inbound HTTP API Trigger         │
+└───────────────────┬────────────────────┘
+                    │
+                    ▼
+┌────────────────────────────────────────┐
+│  DistributedRedisLimiterGuard          │
+│  Sliding Window Rate Limit per Tenant  │
 └───────────────────┬────────────────────┘
                     │  (Sync Key Validation + Template Compilation)
                     ▼
@@ -89,17 +96,20 @@
     │       Redis        │       │      PostgreSQL      │
     │  - Sorted Set cache│       │  - Persistent data   │
     │  - Pub/Sub channel │       │  - Source of truth   │
-    │  (external, shared)│       │  (external, shared)  │
-    └────────────────────┘       └─────────────────────┘
+    │  - Rate limit ZSETs│       │  (external, shared)  │
+    │  - API key cache   │       └─────────────────────┘
+    │  (external, shared)│
+    └────────────────────┘
 ```
 
-Every server instance is stateless and identical. Redis and PostgreSQL are external shared systems — no data lives inside any app server's memory permanently.
+Every server instance is stateless and identical. Redis and PostgreSQL are external shared systems — no data lives inside any app server's memory permanently. Rate limit state is stored in Redis so it is correctly enforced across all instances.
 
 ### System Layers
 
 | Layer | Description |
 |---|---|
 | **API Ingest** | Receives multi-tenant notifications via secure HTTP REST. Validates API keys, compiles templates, maps contact profiles, and records tracking tokens. |
+| **Rate Limiting** | Sliding window counter per tenant stored in Redis ZSET. Enforced before any business logic runs. Works correctly under horizontal scaling because state lives in shared Redis, not instance memory. |
 | **Async Processing** | Forks tasks away from the HTTP loop. Updates operational state and dispatches to channel providers without blocking the client response. |
 | **Redis Pub/Sub** | Replaces the in-process event emitter as the broadcast layer. Any server can publish; every server receives and delivers to the right WebSocket room. |
 | **WebSocket Gateway** | Manages full-duplex TCP connections via Socket.IO. Validates tenant credentials on handshake, isolates users into sandboxed rooms, and pushes live updates. |
@@ -487,6 +497,7 @@ model NotificationEvent {
 
 The following steps execute **synchronously** before the HTTP response is returned:
 
+0. **Rate Limit Check** — `DistributedRedisLimiterGuard` runs before any business logic. See §11 for full details.
 1. **Tenant Identification** — Interceptor hashes the `x-api-key` header via SHA-256 and matches it against the `ApiKey` table to extract `tenantId`.
 2. **Recipient Verification** — Queries the `Contact` table by `(tenantId, externalId)`. Inactive or missing contacts abort the operation immediately with a `404`.
 3. **Template Extraction** — Queries the `Template` table by `(tenantId, slug, channel)`. All three fields are required due to the composite unique constraint.
@@ -657,6 +668,8 @@ redis.module.ts
 │
 ├── REDIS_CLIENT      → general purpose
 │     ├── Cache reads/writes  (ZADD, ZRANGE, ZREM, pipeline)
+│     ├── Rate limit ZSETs    (ZREMRANGEBYSCORE, ZADD, ZCARD, EXPIRE — via pipeline)
+│     ├── API key → tenantId  (GET, SET with EX)
 │     └── Publishing          (redis.publish) ← non-blocking, allowed here
 │
 └── REDIS_SUBSCRIBER  → subscribe mode only
@@ -668,10 +681,10 @@ redis.module.ts
 
 Once a Redis connection calls `SUBSCRIBE`, Redis locks it into subscriber mode — it cannot run any other command. No `GET`, no `SET`, no `ZADD`. If you tried to share one connection for caching and subscribing, every cache operation would throw an error.
 
-Publishing is **not** a blocking operation and does not require a dedicated connection — the regular client handles it alongside all cache operations.
+Publishing is **not** a blocking operation and does not require a dedicated connection — the regular client handles it alongside all cache operations. Rate limiting also uses the regular client via an atomic pipeline.
 
 **Injection tokens:**
-- `REDIS_CLIENT` — injected into `NotificationService` and `NotificationGateway`
+- `REDIS_CLIENT` — injected into `NotificationService`, `NotificationGateway`, and `DistributedRedisLimiterGuard`
 - `REDIS_SUBSCRIBER` — injected into `NotificationGateway` only
 
 ---
@@ -688,6 +701,12 @@ CacheKeyFactory.getAllFeedKey(tenantId, recipientId)
 
 CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId)
 // → 'feed:unread:{tenantId}:{recipientId}'
+
+CacheKeyFactory.getApikey(keyHash)
+// → 'apikey:{keyHash}'
+
+CacheKeyFactory.getTenantRateLimitKey(tenantId)
+// → 'ratelimit:{tenantId}'
 ```
 
 ### Data structure — Redis Sorted Set (ZSET)
@@ -797,7 +816,113 @@ Recommended approach: AES-256-GCM before `prisma.channelConfig.create()`, decryp
 
 ---
 
-## 11. Constants & Key Management
+## 11. Rate Limiting
+
+### Overview
+
+Per-tenant rate limiting is enforced by `DistributedRedisLimiterGuard` on inbound HTTP endpoints. The guard runs as a NestJS `CanActivate` guard, before any controller logic or auth interceptors resolve the tenant from the database.
+
+Because limit state lives in Redis — not instance memory — the limit is correctly enforced across all horizontally scaled server instances. A tenant sending 100 requests split across Servers A, B, and C will still be correctly counted as 100 total.
+
+### Algorithm — Sliding Window (ZSET-based)
+
+A Redis Sorted Set is maintained per tenant. Each request adds one member to the set scored by the current Unix millisecond timestamp. On every request:
+
+```
+1. ZREMRANGEBYSCORE ratelimit:{tenantId}  -inf  (now - WINDOW_DURATION_MS)
+   ← evict all entries older than the window boundary
+
+2. ZADD ratelimit:{tenantId}  now  "{now}:{uuid_fragment}"
+   ← record this request
+
+3. ZCARD ratelimit:{tenantId}
+   ← count total requests inside the window
+
+4. EXPIRE ratelimit:{tenantId}  WINDOW_DURATION_MS/1000
+   ← rolling TTL so idle tenants don't accumulate stale keys
+
+5. if ZCARD > MAX_REQUESTS → 429 Too Many Requests
+```
+
+All four Redis commands execute in a single atomic pipeline — one round-trip.
+
+Unlike a fixed window counter, the sliding window does not reset abruptly at a clock boundary. A tenant using their full quota in the last 10 seconds of minute N cannot immediately re-fire their full quota at the start of minute N+1.
+
+### API key → tenant ID lookup cache
+
+Resolving `tenantId` from an API key would ordinarily require a database query on every single request. The guard caches this mapping in Redis:
+
+```
+Key:   apikey:{sha256_of_raw_key}
+Value: tenantId string
+TTL:   86400s (24 hours)
+```
+
+**Lookup path:**
+
+```
+incoming request
+    │
+    ├── hash x-api-key → keyHash
+    ├── GET apikey:{keyHash} from Redis
+    │       │
+    │       ├── HIT  → use cached tenantId directly
+    │       │
+    │       └── MISS → query ApiKey table in PostgreSQL
+    │                   ├── not found / inactive → pass through (auth guard handles it)
+    │                   └── found → cache tenantId for 24h, proceed
+    │
+    └── apply sliding window check against tenantId
+```
+
+**Why pass through on cache miss with invalid key?** The guard's responsibility is rate limiting, not authentication. If the key doesn't exist or is inactive, the guard returns `true` and lets the downstream auth interceptor reject the request with the appropriate error. This avoids duplicating auth logic.
+
+### Configuration
+
+Defined in `RATE_LIMIT_CONFIG` inside `notification.constants.ts`:
+
+| Constant | Description |
+|---|---|
+| `WINDOW_DURATION_MS` | Rolling time window in milliseconds (e.g. 60000 for 1 minute). |
+| `MAX_REQUESTS` | Maximum requests allowed within the window per tenant. |
+
+### Failure behaviour
+
+| Scenario | Behaviour |
+|---|---|
+| Redis pipeline returns null results | Guard passes (`return true`) — fail open to avoid blocking legitimate traffic on infrastructure issues. |
+| Unexpected runtime exception | Guard logs the error and passes (`return true`) — same fail-open policy. |
+| `HttpException` (429) | Re-thrown immediately — not swallowed. |
+
+**Fail-open rationale:** Rate limiting is a protection layer, not an authentication layer. If Redis is temporarily unavailable, it is better to let requests through than to take down the entire API. Authentication still runs after the guard and will reject genuinely invalid requests.
+
+### Guard placement
+
+```typescript
+// notification.controller.ts
+@Post('/trigger')
+@UseGuards(DistributedRedisLimiterGuard)
+@HttpCode(HttpStatus.CREATED)
+async trigger(
+    @CurrentTenantId() tenantId: string,
+    @Body() body: { workflow: string, recipientId: string, data: Record<string,any> }
+) {
+    return this.notificationService.triggerNotification(tenantId, body);
+}
+```
+
+The guard is currently applied only to `POST /trigger` — the highest-volume inbound endpoint. Other endpoints can adopt the same guard as needed.
+
+### Redis keys introduced
+
+| Key Pattern | Type | TTL | Purpose |
+|---|---|---|---|
+| `apikey:{keyHash}` | String | 24h | Maps SHA-256 API key hash → tenantId to skip DB on hot paths. |
+| `ratelimit:{tenantId}` | ZSET | Rolling (WINDOW_DURATION_MS) | Sliding window request log per tenant. |
+
+---
+
+## 12. Constants & Key Management
 
 Everything that could be a magic string lives in `src/notification/constants/notification.constants.ts`:
 
@@ -808,16 +933,22 @@ REDIS_CHANNELS.PLATFORM_NOTIFICATIONS = 'platform:notifications'
 // WebSocket event name emitted to clients
 WS_EVENTS.NOTIFICATION_RECEIVED = 'notification_received'
 
+// Rate limiting config
+RATE_LIMIT_CONFIG.WINDOW_DURATION_MS  // sliding window size in ms
+RATE_LIMIT_CONFIG.MAX_REQUESTS        // max requests per window per tenant
+
 // Cache key generators
-CacheKeyFactory.getAllFeedKey(tenantId, recipientId)    // → feed:all:{t}:{r}
-CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId) // → feed:unread:{t}:{r}
+CacheKeyFactory.getAllFeedKey(tenantId, recipientId)       // → feed:all:{t}:{r}
+CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId)    // → feed:unread:{t}:{r}
+CacheKeyFactory.getApikey(keyHash)                         // → apikey:{keyHash}
+CacheKeyFactory.getTenantRateLimitKey(tenantId)            // → ratelimit:{tenantId}
 ```
 
-**Rule:** Never hardcode a Redis key string, channel name, or WebSocket event name outside this file. If you need a new constant, add it here first, then import it.
+**Rule:** Never hardcode a Redis key string, channel name, WebSocket event name, or rate limit config value outside this file. If you need a new constant, add it here first, then import it.
 
 ---
 
-## 12. Known Issues & Bugs
+## 13. Known Issues & Bugs
 
 ### Bug — `cacheKeyUnread` was identical to `cacheKeyAll`
 
@@ -852,7 +983,7 @@ const cacheKeyUnread = CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId); 
 
 ---
 
-## 13. How to Extend This Documentation
+## 14. How to Extend This Documentation
 
 **Every time you implement a new feature, update this file before closing the PR.** Use the checklist below — not every item applies to every change, but check all of them.
 
@@ -967,6 +1098,15 @@ Add a subsection under §3:
 
 ---
 
+### Rate Limiting Change
+
+1. Update the algorithm description and config table in §11.
+2. If new Redis keys are introduced, add them to the key table in §11.
+3. Update `CacheKeyFactory` entries in §12.
+4. Document failure/pass-through behaviour if it changes.
+
+---
+
 ### PR Checklist
 
 Copy into every PR description:
@@ -978,17 +1118,49 @@ Copy into every PR description:
 - [ ] Prisma model code blocks updated to match schema.prisma
 - [ ] New workflows or state transitions documented in §3 or §5
 - [ ] Cache behaviour documented or updated in §4 / §8
+- [ ] Rate limiting changes documented in §11
 - [ ] Security implications noted in §10 if relevant
-- [ ] Constants added to notification.constants.ts and documented in §11
-- [ ] Known bugs or issues added to §12
-- [ ] Implementation log entry added to §14
+- [ ] Constants added to notification.constants.ts and documented in §12
+- [ ] Known bugs or issues added to §13
+- [ ] Implementation log entry added to §15
 ```
 
 ---
 
-## 14. Implementation Log
+## 15. Implementation Log
 
 > Add an entry every time a significant feature or architectural decision is shipped.
+
+---
+
+### Distributed Rate Limiting — Per-Tenant Sliding Window
+
+**What was built:**
+- `DistributedRedisLimiterGuard` — NestJS `CanActivate` guard implementing a sliding window rate limiter per tenant using Redis Sorted Sets
+- API key → tenant ID lookup cache (`apikey:{keyHash}`) to avoid a database roundtrip on every inbound request
+- Guard applied to `POST /v1/notifications/trigger` via `@UseGuards`
+- `RATE_LIMIT_CONFIG` constant block (`WINDOW_DURATION_MS`, `MAX_REQUESTS`) added to `notification.constants.ts`
+- `CacheKeyFactory.getApikey()` and `CacheKeyFactory.getTenantRateLimitKey()` added to `notification.constants.ts`
+
+**Why sliding window over fixed window:**
+A fixed window counter resets at a hard clock boundary. A tenant can exhaust their full quota at second 59 of a window, then immediately fire their full quota again at second 0 of the next window — effectively doubling throughput at the boundary. A sliding window scores each request by timestamp and only counts entries within the rolling lookback period, eliminating that boundary spike.
+
+**Why ZSET over a simple counter (`INCR`):**
+`INCR` with `EXPIRE` implements a fixed window. To implement a true sliding window you need to store per-request timestamps so you can evict only entries that have left the window, not reset the whole counter. A ZSET with Unix millisecond scores is the standard Redis pattern for this.
+
+**Atomic pipeline:**
+`ZREMRANGEBYSCORE`, `ZADD`, `ZCARD`, and `EXPIRE` all execute in one pipeline call — single network round-trip, no race conditions between the evict and the count steps.
+
+**Fail-open design:**
+The guard returns `true` (passes) on any unexpected Redis error. Rate limiting is a protection layer; it should never become the cause of an outage. Legitimate traffic still gets authenticated and processed downstream if Redis is briefly unavailable.
+
+**Files changed:**
+- `src/notification/guards/distributed-redis-limiter.guard.ts` — new file
+- `src/notification/constants/notification.constants.ts` — added `RATE_LIMIT_CONFIG`, `CacheKeyFactory.getApikey`, `CacheKeyFactory.getTenantRateLimitKey`
+- `src/notification/notification.controller.ts` — added `@UseGuards(DistributedRedisLimiterGuard)` on `POST /trigger`
+
+**Known limitation:**
+The API key → tenantId cache has a 24-hour TTL. If an API key is revoked, the cached mapping will remain valid for up to 24 hours. Rate limiting will continue to attribute requests to the old tenant until the cache expires. Authentication (downstream of the guard) will still reject the revoked key immediately — only the rate limit attribution is stale. A future improvement would be to actively delete the cache key on API key revocation.
 
 ---
 
@@ -1033,4 +1205,4 @@ Write-through cache currently executes on every server instance that receives th
 
 ---
 
-*Last updated: update this line whenever you add an entry above.*
+*Last updated: Distributed rate limiting guard added.*

@@ -15,6 +15,7 @@ import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 import { CurrentTenantId } from "src/auth/decorator/current-tenant.decorator";
 import { ApiKeyGuard } from "src/auth/api-key.guard";
 import { ReadAllNotificationDto } from "./dtos/read-all.dto";
+import { DistributedRedisLimiterGuard } from "./guards/rate-limiter.guard";
 
 
 
@@ -26,6 +27,7 @@ export class NotificationController {
 
     
     @Post('/trigger')
+    @UseGuards(DistributedRedisLimiterGuard)
     @HttpCode(HttpStatus.CREATED)
     async trigger(
         @CurrentTenantId() tenantId: string,

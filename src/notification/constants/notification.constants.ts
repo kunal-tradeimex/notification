@@ -11,12 +11,24 @@ export const REDIS_CHANNELS = {
 
 
 /**
+ * Distributed redis rate limiting configurations
+ */
+export const RATE_LIMIT_CONFIG = {
+    // Define the how many request is allowed per sliding time window frame
+    MAX_REQUESTS: 100,
+    // Time window frame specified in ms
+    WINDOW_DURATION_MS: 60000,
+}
+
+/**
  * Real-time Websocket event payloads emitted to client interfaces
  */
 
 export const WS_EVENTS = {
     NOTIFICATION_RECEIVED: 'notification_received'
 }
+
+
 
 
 /**
@@ -36,5 +48,19 @@ export const CacheKeyFactory = {
      */
     getUnreadFeedKey (tenantId: string,recipientId: string) {
         return `feed:unread:${tenantId}:${recipientId}`;
+    },
+
+    /**
+     * Generate a unique , isolated tracking key for a tenant's rare limit window
+     */
+    getTenantRateLimitKey (tenantId: string): string {
+        return `rate:tenant:${tenantId}`;
+    },
+
+    /**
+     * Generate the key for the auth api key 
+     */
+    getApikey (keyhash: string): string {
+        return `auth:key:${keyhash}`;
     }
 }

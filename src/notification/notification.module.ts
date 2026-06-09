@@ -8,6 +8,7 @@ import { ProvideFactory } from "./provider/provider.factory";
 import { NotificationGateway } from "./notification.gateway";
 import { RealTimeAuthController } from "./realtime-notification.controller";
 import { RealtimeAuthService } from "./realtime-notification.service";
+import { DistributedRedisLimiterGuard } from "./guards/rate-limiter.guard";
 
 
 
@@ -23,7 +24,8 @@ import { RealtimeAuthService } from "./realtime-notification.service";
         NotificationProcessor,
         ProvideFactory,
         NotificationGateway,
-        RealtimeAuthService
+        RealtimeAuthService,
+        DistributedRedisLimiterGuard
     ]
 })
 export class NotificationModule {};
