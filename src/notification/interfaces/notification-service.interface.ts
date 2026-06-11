@@ -11,7 +11,7 @@ import {
     triggerNotification(
         apiKeyHeader: string,
         payload: TriggerNotificationPayload
-    ) : Promise<TriggerNotificationResponse>
+    ) : any
 
 
     sendInAppNotification(

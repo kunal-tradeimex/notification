@@ -10,7 +10,10 @@ import { NOTIFICATION_CREATED_EVENT, NotificationCreatedEvent } from "./events/n
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { REDIS_CLIENT } from "src/redis/redis.module";
 import Redis from "ioredis";
-import { CacheKeyFactory, REDIS_CHANNELS } from "./constants/notification.constants";
+import { CacheKeyFactory, NotificationQueue, NotificationQueueJobName, REDIS_CHANNELS } from "./constants/notification.constants";
+import { TriggerNotificationPayload, TriggerNotificationResponse } from "./interfaces/trigger-notification.interface";
+import { InjectQueue } from "@nestjs/bullmq";
+import { Queue } from "bullmq";
 
 
 @Injectable()
@@ -25,17 +28,133 @@ export class NotificationService implements INotificationService {
       // That redis client injection is work like both redis client and as well as publisher
       // because client and publisher both are non-blocking operation unlike subscriber which is blocking
       // that why we create a seprate client for the subscriber in redis module 
-      @Inject(REDIS_CLIENT) private redis: Redis
+      @Inject(REDIS_CLIENT) private redis: Redis,
+      @InjectQueue(NotificationQueue.NOTIFICATION_DELIEVERY) private readonly deliveryQueue: Queue
     ) {}
 
 
+    // Old code Without using the BullMQ for process notifiction as a queued job whole req handled in a single req
+    // async triggerNotification(
+    //     tenantId: string,
+    //     bodyData: { workflow: string; recipientId: string; data: Record<string,any> }
+    // ) {
+
+
+    //     // find recipient
+    //     const contact = await this.prisma.contact.findUnique({
+    //         where: {
+    //             tenantId_externalId: {
+    //                 tenantId: tenantId,
+    //                 externalId: bodyData.recipientId
+    //             }
+    //         }
+    //     });
+
+    //     if (!contact || !contact.isActive) {
+    //         throw new NotFoundException(`Contact with externalId ${bodyData.recipientId} not found`);
+    //     }
+
+    //     // match the tenant slug to the workflow requested
+    //     const template = await this.prisma.template.findFirst({
+    //         where: {
+    //             tenantId: tenantId,
+    //             slug: bodyData.workflow
+    //         }
+    //     });
+
+    //     if (!template || !template.isActive) {
+    //         throw new NotFoundException(`Template/Workflow ${bodyData.workflow} not found`);
+    //     }
+
+    //     // compile template using our detached compiler enginer
+    //     const finalSubject = template.subject
+    //           ? this.compiler.compile(template.subject,bodyData.data)
+    //           : null;
+
+    //     const finalBody = this.compiler.compile(template.body,bodyData.data);
+
+    //     let sendToDestinaton = '';
+        
+    //     if (template.channel === ChannelType.EMAIL) sendToDestinaton = contact.email || '';
+    //     if (template.channel === ChannelType.SMS) sendToDestinaton = contact.phone || '';
+    //     if (template.channel === ChannelType.IN_APP) sendToDestinaton = bodyData.recipientId || '';
+
+    //     // save record as pending into the db as pending
+    //     const notification = await this.prisma.notification.create({
+    //         data: {
+    //             tenantId: tenantId,
+    //             contactId: contact.id,
+    //             templateId: template.id,
+    //             channel: template.channel,
+    //             status: NotificationStatus.PENDING,
+    //             to: sendToDestinaton,
+    //             subject: finalSubject,
+    //             body: finalBody,
+    //             events: {
+    //                 create: {
+    //                     event: EventType.CREATED,
+    //                     metadata: { message: 'Notification initialized via API-Trigger' }
+    //                 }
+    //             }
+    //         }
+    //     });
+
+    //     // fire background action async withour using await
+
+    //     this.processor.processNotification(notification.id)
+    //         .then(async (processedNotification) => {
+
+    //             if (template.channel === ChannelType.IN_APP) {
+    //                 const liveStreamPayload: NotificationCreatedEvent = {
+    //                     tenantId: tenantId,
+    //                     recipientId: bodyData.recipientId,
+    //                     notification: {
+    //                         id: notification.id,
+    //                         subject: finalSubject || '',
+    //                         body: finalBody,
+    //                         createdAt: notification.createdAt,
+    //                         isRead: false
+    //                     }
+    //                 }
+
+    //                 // Broadcast this event inside our server's RAM pool so our Gateway can hear it
+    //                 // this.eventEmitter.emit(NOTIFICATION_CREATED_EVENT,liveStreamPayload); // old code for single server instance
+
+    //                 // if we want to use mutiple server instance then emitting event in the Server's RAM pool is
+    //                 // not working well because it can be a possiblitiy server websocket connection is on server A
+    //                 // and load balance redirect the request of that service to the server B and if emitted event 
+    //                 // present in server B how we send the real time update to the user browser so use redis pub/sub here
+
+    //                 await this.redis.publish(
+    //                     REDIS_CHANNELS.PLATFORM_NOTIFICATIONS,
+    //                     JSON.stringify(liveStreamPayload)
+    //                 );
+
+    //                 console.log(`Broadcast event successfully injected into the global Pub/Sub`);
+
+    //             }
+
+    //         })
+    //         .catch((err) => {
+    //             console.error('Failed to trigger background processing chain',err);
+    //         })
+
+    //     // Return Data
+    //     return {
+    //         success: true,
+    //         notificationId: notification.id,
+    //         status: notification.status,
+    //     };
+
+    // }
+
+    // New Code Implementation using the BullMQ to queue the notification as a job in the queue to process later
     async triggerNotification(
         tenantId: string,
-        bodyData: { workflow: string; recipientId: string; data: Record<string,any> }
+        bodyData: { workflow: string,recipientId: string, data: Record<string,any> }
     ) {
 
-
-        // find recipient
+        // validate the target recipient exist along tenant or not
         const contact = await this.prisma.contact.findUnique({
             where: {
                 tenantId_externalId: {
@@ -45,36 +164,37 @@ export class NotificationService implements INotificationService {
             }
         });
 
+
         if (!contact || !contact.isActive) {
             throw new NotFoundException(`Contact with externalId ${bodyData.recipientId} not found`);
         }
 
-        // match the tenant slug to the workflow requested
+        // 2. Validate template of the sending message
         const template = await this.prisma.template.findFirst({
             where: {
                 tenantId: tenantId,
-                slug: bodyData.workflow
-            }
+                slug: bodyData.workflow,
+            },
         });
+
 
         if (!template || !template.isActive) {
             throw new NotFoundException(`Template/Workflow ${bodyData.workflow} not found`);
         }
 
-        // compile template using our detached compiler enginer
+        // 3. Compile Raw Message Strings
         const finalSubject = template.subject
-              ? this.compiler.compile(template.subject,bodyData.data)
-              : null;
+                        ? this.compiler.compile(template.subject, bodyData.data)
+                        : null;
 
-        const finalBody = this.compiler.compile(template.body,bodyData.data);
+        const finalBody = this.compiler.compile(template.body, bodyData.data);
 
-        let sendToDestinaton = '';
-        
-        if (template.channel === ChannelType.EMAIL) sendToDestinaton = contact.email || '';
-        if (template.channel === ChannelType.SMS) sendToDestinaton = contact.phone || '';
-        if (template.channel === ChannelType.IN_APP) sendToDestinaton = bodyData.recipientId || '';
+        let sendToDestination = '';
+        if (template.channel === ChannelType.EMAIL) sendToDestination = contact.email || '';
+        if (template.channel === ChannelType.SMS) sendToDestination = contact.phone || '';
+        if (template.channel === ChannelType.IN_APP) sendToDestination = bodyData.recipientId || '';
 
-        // save record as pending into the db as pending
+        // 4. Initial Database Audit Registration (PENDING State Block)
         const notification = await this.prisma.notification.create({
             data: {
                 tenantId: tenantId,
@@ -82,65 +202,44 @@ export class NotificationService implements INotificationService {
                 templateId: template.id,
                 channel: template.channel,
                 status: NotificationStatus.PENDING,
-                to: sendToDestinaton,
+                to: sendToDestination,
                 subject: finalSubject,
                 body: finalBody,
                 events: {
-                    create: {
-                        event: EventType.CREATED,
-                        metadata: { message: 'Notification initialized via API-Trigger' }
-                    }
-                }
-            }
+                create: {
+                    event: EventType.CREATED,
+                    metadata: { message: 'Notification securely initialized and queued via BullMQ' },
+                },
+                },
+            },
         });
 
-        // fire background action async withour using await
-
-        this.processor.processNotification(notification.id)
-            .then(async (processedNotification) => {
-
-                if (template.channel === ChannelType.IN_APP) {
-                    const liveStreamPayload: NotificationCreatedEvent = {
-                        tenantId: tenantId,
-                        recipientId: bodyData.recipientId,
-                        notification: {
-                            id: notification.id,
-                            subject: finalSubject || '',
-                            body: finalBody,
-                            createdAt: notification.createdAt,
-                            isRead: false
-                        }
-                    }
-
-                    // Broadcast this event inside our server's RAM pool so our Gateway can hear it
-                    // this.eventEmitter.emit(NOTIFICATION_CREATED_EVENT,liveStreamPayload); // old code for single server instance
-
-                    // if we want to use mutiple server instance then emitting event in the Server's RAM pool is
-                    // not working well because it can be a possiblitiy server websocket connection is on server A
-                    // and load balance redirect the request of that service to the server B and if emitted event 
-                    // present in server B how we send the real time update to the user browser so use redis pub/sub here
-
-                    await this.redis.publish(
-                        REDIS_CHANNELS.PLATFORM_NOTIFICATIONS,
-                        JSON.stringify(liveStreamPayload)
-                    );
-
-                    console.log(`Broadcast event successfully injected into the global Pub/Sub`);
-
+        // Instantly add the job in the queue for the further processing and return api response immediately
+        const job = await this.deliveryQueue.add(
+            NotificationQueueJobName.PROCESS_DELIVERY,
+            {
+                notificationId: notification.id,
+                recipientId: bodyData.recipientId,
+                finalSubject,
+                finalBody
+            },
+            {
+                attempts: 3, // automatic retry mechinism if job fails to process
+                backoff: {
+                    type: 'exponential',
+                    delay: 5000 // exponentail delay along retry like 5s, 10s, 20s
                 }
+            }
+        );
 
-            })
-            .catch((err) => {
-                console.error('Failed to trigger background processing chain',err);
-            })
 
-        // Return Data
+        // return an immediate response to the user and process job via queue
         return {
             success: true,
-            notificationId: notification.id,
-            status: notification.status,
+            jobId: job.id,
+            message: 'Notification successfully queued for delivery'
         };
-
+        
     }
 
 

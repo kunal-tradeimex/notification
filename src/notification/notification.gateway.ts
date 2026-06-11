@@ -59,6 +59,7 @@ export class NotificationGateway implements OnGatewayConnection, OnGatewayDiscon
             if (channel === REDIS_CHANNELS.PLATFORM_NOTIFICATIONS) {
                 try {
                     const payload = JSON.parse(message);
+                    console.log("PAYLOAD INSIDE NOTIFICATION GATEWAY IS:",payload.tenantId)
                     const targetRoom = `${payload.tenantId}:${payload.recipientId}`;
 
                     // Direct Persistent Socket Stream Delievery

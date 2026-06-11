@@ -64,3 +64,19 @@ export const CacheKeyFactory = {
         return `auth:key:${keyhash}`;
     }
 }
+
+
+/**
+ * Intialize the Notification queue names
+ */
+export const NotificationQueue = {
+    NOTIFICATION_DELIEVERY: 'notification-delivery'
+}
+
+
+/**
+ * Define the notification queue process/Job name
+ */
+export const NotificationQueueJobName = {
+    PROCESS_DELIVERY: 'process_delivery'
+}
