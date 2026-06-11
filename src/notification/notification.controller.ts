@@ -9,13 +9,15 @@ import { Body,
          UseGuards,
          Patch,
          Param,
-         ParseIntPipe} from "@nestjs/common";
+         ParseIntPipe,
+         UseInterceptors} from "@nestjs/common";
 import { NotificationService } from "./notification.service";
 import { GetFeedQueryDto } from "./dtos/get-feed.dto";
 import { CurrentTenantId } from "src/auth/decorator/current-tenant.decorator";
 import { ApiKeyGuard } from "src/auth/api-key.guard";
 import { ReadAllNotificationDto } from "./dtos/read-all.dto";
 import { DistributedRedisLimiterGuard } from "./guards/rate-limiter.guard";
+import { IdempotencyInterceptor } from "src/interceptors/idempotency.interceptor";
 
 
 
@@ -28,6 +30,7 @@ export class NotificationController {
     
     @Post('/trigger')
     @UseGuards(DistributedRedisLimiterGuard)
+    @UseInterceptors(IdempotencyInterceptor)
     @HttpCode(HttpStatus.CREATED)
     async trigger(
         @CurrentTenantId() tenantId: string,

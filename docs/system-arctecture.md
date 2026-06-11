@@ -25,7 +25,7 @@
 8. [Cache Layer Design](#8-cache-layer-design)
 9. [WebSocket Gateway Internals](#9-websocket-gateway-internals)
 10. [Security Architecture](#10-security-architecture)
-11. [Rate Limiting](#11-rate-limiting)
+11. [Rate Limiting & Idempotency](#11-rate-limiting--idempotency)
 12. [Constants & Key Management](#12-constants--key-management)
 13. [Known Issues & Bugs](#13-known-issues--bugs)
 14. [How to Extend This Documentation](#14-how-to-extend-this-documentation)
@@ -47,16 +47,28 @@
 │  DistributedRedisLimiterGuard          │
 │  Sliding Window Rate Limit per Tenant  │
 └───────────────────┬────────────────────┘
+                    │
+                    ▼
+┌────────────────────────────────────────┐
+│  IdempotencyInterceptor                │
+│  Duplicate POST Prevention via Redis   │
+└───────────────────┬────────────────────┘
                     │  (Sync Key Validation + Template Compilation)
                     ▼
 ┌────────────────────────────────────────┐
 │   PostgreSQL — Notification PENDING    │
 └───────────────────┬────────────────────┘
-                    │  (Fork Async — Return 201 immediately)
+                    │  (Enqueue BullMQ Job — Return 201 immediately)
                     ▼
 ┌────────────────────────────────────────┐
-│    Async Background Processing         │
-│    PROCESSING → SENT / FAILED          │
+│    BullMQ Job Queue (Redis-backed)     │
+│    notification_delivery queue         │
+└───────────────────┬────────────────────┘
+                    │  (Worker pops job — PROCESSING → SENT / FAILED)
+                    ▼
+┌────────────────────────────────────────┐
+│    NotificationProcessor (WorkerHost)  │
+│    Retry: 3 attempts, exponential 5s   │
 └───────────────────┬────────────────────┘
                     │  (redis.publish → platform:notifications)
                     ▼
@@ -98,11 +110,13 @@
     │  - Pub/Sub channel │       │  - Source of truth   │
     │  - Rate limit ZSETs│       │  (external, shared)  │
     │  - API key cache   │       └─────────────────────┘
+    │  - BullMQ queues   │
+    │  - Idempotency keys│
     │  (external, shared)│
     └────────────────────┘
 ```
 
-Every server instance is stateless and identical. Redis and PostgreSQL are external shared systems — no data lives inside any app server's memory permanently. Rate limit state is stored in Redis so it is correctly enforced across all instances.
+Every server instance is stateless and identical. Redis and PostgreSQL are external shared systems — no data lives inside any app server's memory permanently. Rate limit state, job queues, and idempotency records are all stored in Redis so they are correctly enforced across all instances.
 
 ### System Layers
 
@@ -110,7 +124,9 @@ Every server instance is stateless and identical. Redis and PostgreSQL are exter
 |---|---|
 | **API Ingest** | Receives multi-tenant notifications via secure HTTP REST. Validates API keys, compiles templates, maps contact profiles, and records tracking tokens. |
 | **Rate Limiting** | Sliding window counter per tenant stored in Redis ZSET. Enforced before any business logic runs. Works correctly under horizontal scaling because state lives in shared Redis, not instance memory. |
-| **Async Processing** | Forks tasks away from the HTTP loop. Updates operational state and dispatches to channel providers without blocking the client response. |
+| **Idempotency** | Duplicate POST prevention via Redis Hash per `(tenantId, x-idempotency-key)`. Returns cached response on replay without re-executing any business logic. |
+| **Job Queue** | BullMQ Redis-backed queue decouples HTTP ingestion from provider dispatch. Supports automatic retries with exponential backoff. Jobs survive server restarts. |
+| **Async Processing** | BullMQ `WorkerHost` pops jobs and handles provider dispatch. Updates operational state and dispatches to channel providers without blocking the client response. |
 | **Redis Pub/Sub** | Replaces the in-process event emitter as the broadcast layer. Any server can publish; every server receives and delivers to the right WebSocket room. |
 | **WebSocket Gateway** | Manages full-duplex TCP connections via Socket.IO. Validates tenant credentials on handshake, isolates users into sandboxed rooms, and pushes live updates. |
 | **Dual-Cache Engine** | Maintains Redis Sorted Sets for `feed:all` and `feed:unread` timelines. Resolves index queries in O(log N) without touching PostgreSQL. |
@@ -497,42 +513,61 @@ model NotificationEvent {
 
 The following steps execute **synchronously** before the HTTP response is returned:
 
-0. **Rate Limit Check** — `DistributedRedisLimiterGuard` runs before any business logic. See §11 for full details.
-1. **Tenant Identification** — Interceptor hashes the `x-api-key` header via SHA-256 and matches it against the `ApiKey` table to extract `tenantId`.
-2. **Recipient Verification** — Queries the `Contact` table by `(tenantId, externalId)`. Inactive or missing contacts abort the operation immediately with a `404`.
-3. **Template Extraction** — Queries the `Template` table by `(tenantId, slug, channel)`. All three fields are required due to the composite unique constraint.
-4. **Dynamic Compilation** — Regex-replaces `{{variable}}` keys in the template body with runtime values from the request `data` payload.
-5. **Persistence** — A `Notification` row is written with `status: PENDING`. A `NotificationEvent` of type `CREATED` is appended.
-6. **Fast Response** — A `201 Created` response with the notification `id` is returned. Background processing is forked asynchronously.
+0. **Rate Limit Check** — `DistributedRedisLimiterGuard` runs before any business logic. See §11.1 for full details.
+1. **Idempotency Check** — `IdempotencyInterceptor` reads the `x-idempotency-key` header. If a cached `RESOLVED` response exists in Redis, it is returned immediately without touching the database. If a `PROCESSING` lock is active, a `409 Conflict` is returned. See §11.2 for full details.
+2. **Tenant Identification** — Interceptor hashes the `x-api-key` header via SHA-256 and matches it against the `ApiKey` table to extract `tenantId`.
+3. **Recipient Verification** — Queries the `Contact` table by `(tenantId, externalId)`. Inactive or missing contacts abort with `404`.
+4. **Template Extraction** — Queries the `Template` table by `(tenantId, slug, channel)`. All three fields are required due to the composite unique constraint.
+5. **Dynamic Compilation** — Regex-replaces `{{variable}}` keys in the template body with runtime values from the request `data` payload.
+6. **Persistence** — A `Notification` row is written with `status: PENDING`. A `NotificationEvent` of type `CREATED` is appended.
+7. **Queue Enqueue** — A BullMQ job is added to the `notification_delivery` queue with `attempts: 3` and exponential backoff (5s → 10s → 20s). The job payload includes `notificationId`, `tenantId`, `recipientId`, `finalSubject`, and `finalBody`.
+8. **Fast Response** — `{ success: true, jobId, message }` is returned immediately. The worker processes the job asynchronously.
 
-### 3.2 Async Background Processing
+### 3.2 Async Background Processing — BullMQ Worker
 
-After the HTTP response is sent, a background worker handles provider dispatch:
+The `NotificationProcessor` extends `WorkerHost` and is decorated with `@Processor(NotificationQueue.NOTIFICATION_DELIVERY)`. BullMQ pops jobs off the Redis-backed queue and calls `process(job)` automatically.
 
 ```
-processor.processNotification(notification)
+BullMQ pops job off queue
     │
+    ├── fetch full Notification from PostgreSQL (with tenant relation)
     ├── prisma.notification.update({ status: PROCESSING })
-    ├── prisma.notificationEvent.create({ event: PROCESSING_STARTED })
     │
-    ├── simulate provider dispatch (setTimeout)
-    │     └── real adapters (SendGrid/Twilio/FCM) plug in here
+    ├── fetch ChannelConfig for (tenantId, channel)
+    ├── resolve provider via ProviderFactory
+    ├── provider.send({ to, subject, body, credentials })
     │
-    ├── prisma.notification.update({ status: SENT, sentAt: now() })
-    ├── prisma.notificationEvent.create({ event: DELIVERED })
+    ├── on success:
+    │     ├── prisma.notification.update({ status: SENT, sentAt: now() })
+    │     └── prisma.notificationEvent.create({ event: SENT })
     │
     └── if channel === IN_APP:
             └── redis.publish('platform:notifications', JSON.stringify({
                     tenantId,
                     recipientId,
-                    notification
+                    notification: { id, subject, body, createdAt, isRead: false }
                 }))
 ```
 
+**Retry behaviour:**
+- `attempts: 3` configured at enqueue time in `NotificationService`
+- `backoff: { type: 'exponential', delay: 5000 }` — retries fire at 5s, 10s, 20s
+- On terminal failure: status set to `FAILED`, `failedAt` and `errorMessage` written, `EventType.FAILED` appended, error re-thrown so BullMQ marks the job as failed
+
 **State resolution:**
-- **Success** → status `SENT`, `sentAt` + `deliveredAt` recorded, audit events `SENT` + `DELIVERED` appended.
-- **Transient failure** → `retryCount` incremented, `RETRYING` audit event appended, job re-queued.
-- **Terminal failure** → after `maxRetries` exhaustion, status `FAILED`, `failedAt` set, `errorMessage` recorded.
+- **Success** → status `SENT`, `sentAt` recorded, `SENT` audit event appended.
+- **Transient failure** → BullMQ retries automatically per backoff config, `RETRYING` audit event appended.
+- **Terminal failure** → after all attempts exhausted, status `FAILED`, `failedAt` set, `errorMessage` recorded.
+
+**Queue registration in `NotificationModule`:**
+```typescript
+BullModule.forRoot({
+    connection: { host: process.env.REDIS_HOST, port: parseInt(process.env.REDIS_PORT) }
+})
+BullModule.registerQueue({ name: NotificationQueue.NOTIFICATION_DELIVERY })
+```
+
+The queue shares the same Redis instance as the cache and rate limiter but uses its own internal key namespace (`bull:{queueName}:*`) managed by BullMQ — no collision with application keys.
 
 ---
 
@@ -635,7 +670,7 @@ Trigger HTTP ──────────────→ Load Balancer ──�
 
 ### How it works
 
-- **Publisher** (`notification.service.ts`) — calls `redis.publish('platform:notifications', payload)` after every IN_APP notification is processed. Any server instance can be the publisher.
+- **Publisher** (`notification.processor.ts`) — calls `redis.publish('platform:notifications', payload)` after every IN_APP notification is processed inside the BullMQ worker. Any server instance can be the publisher.
 - **Subscriber** (`notification.gateway.ts`) — every server instance subscribes to `platform:notifications` in `onModuleInit()`. The subscription is persistent for the life of the process.
 - **Delivery** — whichever instance holds the user's WebSocket room delivers the event. Instances without the socket silently ignore it.
 
@@ -667,24 +702,27 @@ Three Redis connections exist per server instance. Each has a specific non-overl
 redis.module.ts
 │
 ├── REDIS_CLIENT      → general purpose
-│     ├── Cache reads/writes  (ZADD, ZRANGE, ZREM, pipeline)
-│     ├── Rate limit ZSETs    (ZREMRANGEBYSCORE, ZADD, ZCARD, EXPIRE — via pipeline)
-│     ├── API key → tenantId  (GET, SET with EX)
-│     └── Publishing          (redis.publish) ← non-blocking, allowed here
+│     ├── Cache reads/writes    (ZADD, ZRANGE, ZREM, pipeline)
+│     ├── Rate limit ZSETs      (ZREMRANGEBYSCORE, ZADD, ZCARD, EXPIRE — via pipeline)
+│     ├── API key → tenantId    (GET, SET with EX)
+│     ├── Idempotency records   (HSET, HGETALL, EXPIRE)
+│     └── Publishing            (redis.publish) ← non-blocking, allowed here
 │
 └── REDIS_SUBSCRIBER  → subscribe mode only
       └── subscribe('platform:notifications')
           └── on('message', handler)
 ```
 
-**Why two clients?**
+> BullMQ manages its own internal Redis connections separately via the `BullModule.forRoot` connection config. These are not the same connections as `REDIS_CLIENT` or `REDIS_SUBSCRIBER` — BullMQ creates and owns its own pool.
+
+**Why two application clients?**
 
 Once a Redis connection calls `SUBSCRIBE`, Redis locks it into subscriber mode — it cannot run any other command. No `GET`, no `SET`, no `ZADD`. If you tried to share one connection for caching and subscribing, every cache operation would throw an error.
 
-Publishing is **not** a blocking operation and does not require a dedicated connection — the regular client handles it alongside all cache operations. Rate limiting also uses the regular client via an atomic pipeline.
+Publishing is **not** a blocking operation and does not require a dedicated connection — the regular client handles it alongside all cache operations.
 
 **Injection tokens:**
-- `REDIS_CLIENT` — injected into `NotificationService`, `NotificationGateway`, and `DistributedRedisLimiterGuard`
+- `REDIS_CLIENT` — injected into `NotificationService`, `NotificationGateway`, `NotificationProcessor`, and `DistributedRedisLimiterGuard`
 - `REDIS_SUBSCRIBER` — injected into `NotificationGateway` only
 
 ---
@@ -707,6 +745,9 @@ CacheKeyFactory.getApikey(keyHash)
 
 CacheKeyFactory.getTenantRateLimitKey(tenantId)
 // → 'ratelimit:{tenantId}'
+
+CacheKeyFactory.getIdempotencyKey(tenantId, idempotencyKey)
+// → 'idempotency:{tenantId}:{idempotencyKey}'
 ```
 
 ### Data structure — Redis Sorted Set (ZSET)
@@ -816,15 +857,17 @@ Recommended approach: AES-256-GCM before `prisma.channelConfig.create()`, decryp
 
 ---
 
-## 11. Rate Limiting
+## 11. Rate Limiting & Idempotency
 
-### Overview
+### 11.1 Distributed Rate Limiting — Per-Tenant Sliding Window
+
+#### Overview
 
 Per-tenant rate limiting is enforced by `DistributedRedisLimiterGuard` on inbound HTTP endpoints. The guard runs as a NestJS `CanActivate` guard, before any controller logic or auth interceptors resolve the tenant from the database.
 
 Because limit state lives in Redis — not instance memory — the limit is correctly enforced across all horizontally scaled server instances. A tenant sending 100 requests split across Servers A, B, and C will still be correctly counted as 100 total.
 
-### Algorithm — Sliding Window (ZSET-based)
+#### Algorithm — Sliding Window (ZSET-based)
 
 A Redis Sorted Set is maintained per tenant. Each request adds one member to the set scored by the current Unix millisecond timestamp. On every request:
 
@@ -848,7 +891,7 @@ All four Redis commands execute in a single atomic pipeline — one round-trip.
 
 Unlike a fixed window counter, the sliding window does not reset abruptly at a clock boundary. A tenant using their full quota in the last 10 seconds of minute N cannot immediately re-fire their full quota at the start of minute N+1.
 
-### API key → tenant ID lookup cache
+#### API key → tenant ID lookup cache
 
 Resolving `tenantId` from an API key would ordinarily require a database query on every single request. The guard caches this mapping in Redis:
 
@@ -875,9 +918,7 @@ incoming request
     └── apply sliding window check against tenantId
 ```
 
-**Why pass through on cache miss with invalid key?** The guard's responsibility is rate limiting, not authentication. If the key doesn't exist or is inactive, the guard returns `true` and lets the downstream auth interceptor reject the request with the appropriate error. This avoids duplicating auth logic.
-
-### Configuration
+#### Configuration
 
 Defined in `RATE_LIMIT_CONFIG` inside `notification.constants.ts`:
 
@@ -886,7 +927,7 @@ Defined in `RATE_LIMIT_CONFIG` inside `notification.constants.ts`:
 | `WINDOW_DURATION_MS` | Rolling time window in milliseconds (e.g. 60000 for 1 minute). |
 | `MAX_REQUESTS` | Maximum requests allowed within the window per tenant. |
 
-### Failure behaviour
+#### Failure behaviour
 
 | Scenario | Behaviour |
 |---|---|
@@ -894,31 +935,92 @@ Defined in `RATE_LIMIT_CONFIG` inside `notification.constants.ts`:
 | Unexpected runtime exception | Guard logs the error and passes (`return true`) — same fail-open policy. |
 | `HttpException` (429) | Re-thrown immediately — not swallowed. |
 
-**Fail-open rationale:** Rate limiting is a protection layer, not an authentication layer. If Redis is temporarily unavailable, it is better to let requests through than to take down the entire API. Authentication still runs after the guard and will reject genuinely invalid requests.
+**Fail-open rationale:** Rate limiting is a protection layer, not an authentication layer. If Redis is temporarily unavailable, it is better to let requests through than to take down the entire API.
 
-### Guard placement
+#### Guard placement
 
 ```typescript
 // notification.controller.ts
 @Post('/trigger')
 @UseGuards(DistributedRedisLimiterGuard)
 @HttpCode(HttpStatus.CREATED)
-async trigger(
-    @CurrentTenantId() tenantId: string,
-    @Body() body: { workflow: string, recipientId: string, data: Record<string,any> }
-) {
-    return this.notificationService.triggerNotification(tenantId, body);
-}
+async trigger(...) { ... }
 ```
 
-The guard is currently applied only to `POST /trigger` — the highest-volume inbound endpoint. Other endpoints can adopt the same guard as needed.
-
-### Redis keys introduced
+#### Redis keys
 
 | Key Pattern | Type | TTL | Purpose |
 |---|---|---|---|
 | `apikey:{keyHash}` | String | 24h | Maps SHA-256 API key hash → tenantId to skip DB on hot paths. |
 | `ratelimit:{tenantId}` | ZSET | Rolling (WINDOW_DURATION_MS) | Sliding window request log per tenant. |
+
+---
+
+### 11.2 Idempotency — Duplicate POST Request Prevention
+
+#### Overview
+
+`IdempotencyInterceptor` is a NestJS `NestInterceptor` that prevents duplicate POST requests from being processed more than once. It sits between the guard layer and the controller, applied to `POST /v1/notifications/trigger`.
+
+The client supplies an `x-idempotency-key` header — a unique string per logical operation (e.g. a UUID). If the same key is replayed, the interceptor returns the cached response without re-executing any business logic, database writes, or queue enqueues.
+
+#### Redis storage — Hash per key
+
+```
+Key:    idempotency:{tenantId}:{idempotencyKey}
+Type:   Redis Hash (HSET / HGETALL)
+TTL:    86400s (24 hours)
+
+Fields:
+  status          → 'PROCESSING' | 'RESOLVED'
+  request_hash    → SHA-256 of JSON.stringify(request.body)
+  response_body   → JSON.stringify(response)  ← written on RESOLVED
+```
+
+#### Request lifecycle
+
+```
+Incoming POST with x-idempotency-key
+    │
+    ├── hash request body → SHA-256 fingerprint
+    ├── HGETALL idempotency:{tenantId}:{key}
+    │
+    │   ┌── Key does not exist (brand new request)
+    │   │     └── HSET status=PROCESSING, request_hash=<hash>
+    │   │         EXPIRE 86400
+    │   │         → pass to controller
+    │   │         → on response: HSET status=RESOLVED, response_body=<json>
+    │   │
+    │   ├── Key exists, status=PROCESSING
+    │   │     └── 409 Conflict — original request still in flight
+    │   │
+    │   ├── Key exists, status=RESOLVED, hash matches
+    │   │     └── return cached response_body immediately (no DB, no queue)
+    │   │
+    │   └── Key exists, status=RESOLVED, hash mismatch
+    │         └── 400 Bad Request — idempotency key reuse with different payload
+    │
+    └── Missing x-idempotency-key header entirely
+          └── 400 Bad Request — key is required on all POST requests
+```
+
+#### Body fingerprint
+
+The SHA-256 hash of `JSON.stringify(request.body)` is stored alongside the key. If a client replays the same `x-idempotency-key` with a **different request body**, the interceptor throws `400 Bad Request`. This prevents accidental key reuse across semantically different operations.
+
+#### Why this matters with BullMQ
+
+The trigger endpoint enqueues a BullMQ job and returns immediately. Without idempotency, a client that retries on a network timeout (before receiving the `201`) would enqueue a **second job** for the same logical operation — resulting in the end-user receiving a duplicate notification. The interceptor ensures the second request returns the original `jobId` without touching BullMQ or PostgreSQL.
+
+#### Scope
+
+Only applied to `POST` requests. `GET`, `PATCH`, and other methods pass through immediately without any Redis interaction.
+
+#### Redis key introduced
+
+| Key Pattern | Type | TTL | Purpose |
+|---|---|---|---|
+| `idempotency:{tenantId}:{idempotencyKey}` | Hash | 24h | Stores request fingerprint, status, and cached response per logical operation. |
 
 ---
 
@@ -933,22 +1035,70 @@ REDIS_CHANNELS.PLATFORM_NOTIFICATIONS = 'platform:notifications'
 // WebSocket event name emitted to clients
 WS_EVENTS.NOTIFICATION_RECEIVED = 'notification_received'
 
+// BullMQ queue name
+NotificationQueue.NOTIFICATION_DELIVERY = 'notification_delivery'
+
+// BullMQ job name
+NotificationQueueJobName.PROCESS_DELIVERY = 'process_delivery'
+
 // Rate limiting config
 RATE_LIMIT_CONFIG.WINDOW_DURATION_MS  // sliding window size in ms
 RATE_LIMIT_CONFIG.MAX_REQUESTS        // max requests per window per tenant
 
 // Cache key generators
-CacheKeyFactory.getAllFeedKey(tenantId, recipientId)       // → feed:all:{t}:{r}
-CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId)    // → feed:unread:{t}:{r}
-CacheKeyFactory.getApikey(keyHash)                         // → apikey:{keyHash}
-CacheKeyFactory.getTenantRateLimitKey(tenantId)            // → ratelimit:{tenantId}
+CacheKeyFactory.getAllFeedKey(tenantId, recipientId)
+// → 'feed:all:{tenantId}:{recipientId}'
+
+CacheKeyFactory.getUnreadFeedKey(tenantId, recipientId)
+// → 'feed:unread:{tenantId}:{recipientId}'
+
+CacheKeyFactory.getApikey(keyHash)
+// → 'apikey:{keyHash}'
+
+CacheKeyFactory.getTenantRateLimitKey(tenantId)
+// → 'ratelimit:{tenantId}'
+
+CacheKeyFactory.getIdempotencyKey(tenantId, idempotencyKey)
+// → 'idempotency:{tenantId}:{idempotencyKey}'
 ```
 
-**Rule:** Never hardcode a Redis key string, channel name, WebSocket event name, or rate limit config value outside this file. If you need a new constant, add it here first, then import it.
+**Rule:** Never hardcode a Redis key string, channel name, WebSocket event name, queue name, or rate limit config value outside this file. If you need a new constant, add it here first, then import it.
 
 ---
 
 ## 13. Known Issues & Bugs
+
+### Bug — Non-IN_APP channels throw unconditionally in the BullMQ processor
+
+**File:** `notification.processor.ts` — inside `process()`, after the provider `send()` call
+
+**What happens:**
+```typescript
+// WRONG — the else branch throws for every non-IN_APP channel
+if (notificaiton.channel === ChannelType.IN_APP) {
+    await this.redis.publish(REDIS_CHANNELS.PLATFORM_NOTIFICATIONS, JSON.stringify(liveStreamPayload));
+} else {
+    throw new Error('Something went wrong in notification Delivery'); // ← bug
+}
+```
+
+**Effect:** Any notification on EMAIL, SMS, PUSH, or WEBHOOK dispatches successfully to the provider and marks itself `SENT` in the database — then immediately throws in the `else` branch. BullMQ treats the throw as a job failure and retries it up to 3 times. After exhausting retries the notification ends up `FAILED` in the database even though the provider send succeeded. End users receive the notification but the system records it as a failure.
+
+**Fix:**
+```typescript
+// CORRECT — redis.publish is only relevant for IN_APP; other channels are done after provider.send()
+if (notificaiton.channel === ChannelType.IN_APP) {
+    await this.redis.publish(
+        REDIS_CHANNELS.PLATFORM_NOTIFICATIONS,
+        JSON.stringify(liveStreamPayload)
+    );
+}
+// no else block needed
+```
+
+**Status:** Fix pending — apply before testing EMAIL/SMS/PUSH/WEBHOOK delivery.
+
+---
 
 ### Bug — `cacheKeyUnread` was identical to `cacheKeyAll`
 
@@ -1013,6 +1163,7 @@ Add a subsection under §3 (or a new section) using this structure:
 
 **Cache behaviour:** which Redis keys are written, read, or invalidated.
 **Events emitted:** e.g. redis.publish on platform:notifications.
+**Queue behaviour:** whether a BullMQ job is enqueued and with what payload.
 ```
 
 ---
@@ -1071,12 +1222,14 @@ Add a subsection under §3:
 ### 3.X Job Name
 
 **Triggered by:** cron / event / manual API call
+**Queue:** BullMQ queue name
+**Job payload fields:** list all fields passed in job.data
 **Steps:**
 1. ...
 2. ...
 **State transitions:** which statuses change
 **Audit events written:** which EventType values are appended
-**Failure handling:** retry logic, dead-letter, alerting
+**Failure handling:** retry config, dead-letter, alerting
 ```
 
 ---
@@ -1100,10 +1253,18 @@ Add a subsection under §3:
 
 ### Rate Limiting Change
 
-1. Update the algorithm description and config table in §11.
-2. If new Redis keys are introduced, add them to the key table in §11.
+1. Update the algorithm description and config table in §11.1.
+2. If new Redis keys are introduced, add them to the key table in §11.1.
 3. Update `CacheKeyFactory` entries in §12.
 4. Document failure/pass-through behaviour if it changes.
+
+---
+
+### Idempotency Change
+
+1. Update the lifecycle diagram in §11.2.
+2. Document any new fields added to the Redis Hash.
+3. If TTL or scope changes, update the key table in §11.2.
 
 ---
 
@@ -1118,7 +1279,8 @@ Copy into every PR description:
 - [ ] Prisma model code blocks updated to match schema.prisma
 - [ ] New workflows or state transitions documented in §3 or §5
 - [ ] Cache behaviour documented or updated in §4 / §8
-- [ ] Rate limiting changes documented in §11
+- [ ] Rate limiting changes documented in §11.1
+- [ ] Idempotency changes documented in §11.2
 - [ ] Security implications noted in §10 if relevant
 - [ ] Constants added to notification.constants.ts and documented in §12
 - [ ] Known bugs or issues added to §13
@@ -1130,6 +1292,58 @@ Copy into every PR description:
 ## 15. Implementation Log
 
 > Add an entry every time a significant feature or architectural decision is shipped.
+
+---
+
+### BullMQ Job Queue — Reliable Async Notification Delivery
+
+**What was built:**
+- `BullModule.forRoot` registered in `NotificationModule` connecting BullMQ to the shared Redis instance
+- `BullModule.registerQueue({ name: NotificationQueue.NOTIFICATION_DELIVERY })` registers the delivery queue
+- `NotificationProcessor` refactored from a plain `Injectable` into a `WorkerHost` decorated with `@Processor(NotificationQueue.NOTIFICATION_DELIVERY)` — BullMQ calls `process(job)` automatically
+- `NotificationService.triggerNotification` now calls `deliveryQueue.add(...)` instead of a raw `.then()` fire-and-forget chain
+- Job payload: `{ notificationId, tenantId, recipientId, finalSubject, finalBody }`
+- Retry config: `attempts: 3`, exponential backoff at 5s base delay (5s → 10s → 20s)
+- API response changed from `{ notificationId, status }` to `{ success, jobId, message }`
+- `NotificationQueue` and `NotificationQueueJobName` constants added to `notification.constants.ts`
+
+**Why BullMQ over raw async fire-and-forget:**
+The old pattern (`processor.processNotification().then(...).catch(...)`) had no retry mechanism — a transient provider failure permanently failed the notification with no recovery path. BullMQ stores jobs in Redis with full lifecycle tracking (`waiting → active → completed/failed`), automatic retry with configurable backoff, and the ability to inspect queue state via dashboards. Jobs also survive server restarts — if the Node process crashes mid-delivery, BullMQ re-queues the stalled job on restart.
+
+**Why the queue shares the Redis instance:**
+BullMQ uses its own internal key namespace (`bull:{queueName}:*`) so there is no collision with the application's cache keys (`feed:*`, `ratelimit:*`, `apikey:*`, `idempotency:*`). One Redis config reduces operational surface area.
+
+**Files changed:**
+- `src/notification/notification.module.ts` — added `BullModule.forRoot`, `BullModule.registerQueue`
+- `src/notification/notification.processor.ts` — extended `WorkerHost`, replaced `processNotification()` with `process(job)`
+- `src/notification/notification.service.ts` — injected `@InjectQueue`, replaced fire-and-forget with `deliveryQueue.add(...)`
+- `src/notification/constants/notification.constants.ts` — added `NotificationQueue`, `NotificationQueueJobName`
+
+**Known issue:** The processor's `else` branch incorrectly throws for non-IN_APP channels. See §13.
+
+---
+
+### Idempotency Interceptor — Duplicate POST Request Prevention
+
+**What was built:**
+- `IdempotencyInterceptor` — NestJS `NestInterceptor` applied to `POST /v1/notifications/trigger`
+- Redis Hash per `(tenantId, x-idempotency-key)` storing request fingerprint, status, and cached response body
+- SHA-256 fingerprint of `request.body` prevents key reuse across different payloads
+- `PROCESSING` lock prevents concurrent duplicate requests from both executing simultaneously
+- `RESOLVED` state returns the cached response with no database or queue access
+- 24-hour TTL on all idempotency keys
+- `CacheKeyFactory.getIdempotencyKey(tenantId, key)` added to `notification.constants.ts`
+
+**Why idempotency is critical with BullMQ:**
+The trigger endpoint enqueues a job and returns immediately. A client that retries on a network timeout before receiving the `201` would enqueue a second job — the end-user receives a duplicate notification. The interceptor ensures the replay returns the original `jobId` without re-touching BullMQ or PostgreSQL.
+
+**Why Redis Hash over String:**
+A Hash stores multiple fields (`status`, `request_hash`, `response_body`) under one key and allows atomic field-level updates with `HSET`. A String would require serializing and deserializing the entire record as JSON on every read/write.
+
+**Files changed:**
+- `src/notification/interceptors/idempotency.interceptor.ts` — new file
+- `src/notification/constants/notification.constants.ts` — added `CacheKeyFactory.getIdempotencyKey`
+- `src/notification/notification.controller.ts` — added `@UseInterceptors(IdempotencyInterceptor)` on `POST /trigger`
 
 ---
 
@@ -1148,11 +1362,8 @@ A fixed window counter resets at a hard clock boundary. A tenant can exhaust the
 **Why ZSET over a simple counter (`INCR`):**
 `INCR` with `EXPIRE` implements a fixed window. To implement a true sliding window you need to store per-request timestamps so you can evict only entries that have left the window, not reset the whole counter. A ZSET with Unix millisecond scores is the standard Redis pattern for this.
 
-**Atomic pipeline:**
-`ZREMRANGEBYSCORE`, `ZADD`, `ZCARD`, and `EXPIRE` all execute in one pipeline call — single network round-trip, no race conditions between the evict and the count steps.
-
 **Fail-open design:**
-The guard returns `true` (passes) on any unexpected Redis error. Rate limiting is a protection layer; it should never become the cause of an outage. Legitimate traffic still gets authenticated and processed downstream if Redis is briefly unavailable.
+The guard returns `true` (passes) on any unexpected Redis error. Rate limiting is a protection layer; it should never become the cause of an outage.
 
 **Files changed:**
 - `src/notification/guards/distributed-redis-limiter.guard.ts` — new file
@@ -1160,14 +1371,14 @@ The guard returns `true` (passes) on any unexpected Redis error. Rate limiting i
 - `src/notification/notification.controller.ts` — added `@UseGuards(DistributedRedisLimiterGuard)` on `POST /trigger`
 
 **Known limitation:**
-The API key → tenantId cache has a 24-hour TTL. If an API key is revoked, the cached mapping will remain valid for up to 24 hours. Rate limiting will continue to attribute requests to the old tenant until the cache expires. Authentication (downstream of the guard) will still reject the revoked key immediately — only the rate limit attribution is stale. A future improvement would be to actively delete the cache key on API key revocation.
+The API key → tenantId cache has a 24-hour TTL. If an API key is revoked, the cached mapping remains valid for up to 24 hours. Authentication downstream will still reject the revoked key immediately — only the rate limit attribution is stale. A future improvement would actively delete the cache key on revocation.
 
 ---
 
 ### Core Notification Pipeline
 
 **What was built:**
-- `POST /v1/notifications/trigger` — sync ingestion, async processing fork
+- `POST /v1/notifications/trigger` — sync ingestion, BullMQ queue enqueue
 - `GET /v1/notifications/feed` — Redis cache-aside read with PostgreSQL fallback
 - `PATCH /v1/notifications/:id/read` — surgical single-notification cache invalidation
 - `POST /v1/notifications/read-all` — bulk read with nuke-and-rebuild cache strategy
@@ -1186,8 +1397,8 @@ The API key → tenantId cache has a 24-hour TTL. If an API key is revoked, the 
 **What was built:**
 - Dedicated `REDIS_SUBSCRIBER` client in `redis.module.ts`
 - `NotificationGateway.onModuleInit()` subscribes to `platform:notifications` on startup
-- `NotificationService` publishes to `platform:notifications` after every IN_APP notification is processed
-- Write-through cache update moved into the Pub/Sub message handler so all instances stay cache-consistent
+- `NotificationProcessor` (BullMQ worker) publishes to `platform:notifications` after every IN_APP notification is processed
+- Write-through cache update inside the Pub/Sub message handler so all instances stay cache-consistent
 - `CacheKeyFactory` introduced to centralize all Redis key generation
 - `REDIS_CHANNELS` and `WS_EVENTS` constants introduced to eliminate magic strings
 
@@ -1197,12 +1408,12 @@ In-memory event emitters don't cross server process boundaries. Under a load bal
 **Files changed:**
 - `src/notification/constants/notification.constants.ts` — new file
 - `src/notification/notification.gateway.ts` — added `onModuleInit`, Redis subscriber, cache write logic
-- `src/notification/notification.service.ts` — replaced `eventEmitter.emit` with `redis.publish`, fixed cache key bug, renamed `sendInMapNotification` → `sendInAppNotification`
+- `src/notification/notification.service.ts` — replaced `eventEmitter.emit` with queue enqueue
 - `src/redis/redis.module.ts` — added `REDIS_SUBSCRIBER` provider
 
 **Known limitation:**
-Write-through cache currently executes on every server instance that receives the Pub/Sub message — all three will run the pipeline. This is harmless since `ZADD` is idempotent for the same score and value, but it's wasteful. A future optimization would use a distributed lock or a Redis-level deduplication key to ensure only one instance writes the cache per event.
+Write-through cache currently executes on every server instance that receives the Pub/Sub message. This is harmless since `ZADD` is idempotent for the same score and value, but wasteful. A future optimization would use a distributed lock to ensure only one instance writes the cache per event.
 
 ---
 
-*Last updated: Distributed rate limiting guard added.*
+*Last updated: BullMQ job queue and idempotency interceptor added.*

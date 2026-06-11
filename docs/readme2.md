@@ -1,20 +1,21 @@
-# NaaS — Notification-as-a-Service
+# NaaS — Notification as a Service
 
-A multi-tenant notification platform that lets any client application send **email, SMS, push, and in-app notifications** through a single API. Built to understand how real notification infrastructure works at scale — async processing, real-time delivery, high-performance caching, horizontally scalable WebSocket broadcasting, and distributed rate limiting.
-
-> This is a solo project. Built from scratch, no boilerplate.
+A multi-tenant Notification-as-a-Service platform built with NestJS, PostgreSQL, Redis, and Socket.IO. Send notifications across Email, SMS, Push, Webhook, and In-App channels through a single unified API.
 
 ---
 
-## What it does
+## Features
 
-- One API call triggers a notification to any channel
-- Templates are pre-defined per tenant with dynamic variable support (`{{name}}`, etc.)
-- In-app notifications stream to the browser **in real-time over WebSockets**
-- A Redis-backed feed returns notification history in under 2ms
-- **WebSocket broadcasting works across multiple server instances** via Redis Pub/Sub
-- **Per-tenant rate limiting enforced across all instances** via Redis sliding window
-- Every notification has a full **audit trail** of lifecycle events
+- **Multi-channel delivery** — EMAIL, SMS, PUSH, WEBHOOK, IN_APP through one trigger endpoint
+- **Multi-tenant isolation** — every resource (contacts, templates, credentials, notifications) is scoped to a tenant workspace
+- **Template engine** — Handlebars/Liquid-style `{{variable}}` compilation at runtime
+- **Reliable async processing** — BullMQ job queue with automatic retry and exponential backoff
+- **Idempotent API** — replay-safe POST requests via `x-idempotency-key` header
+- **Per-tenant rate limiting** — sliding window algorithm via Redis Sorted Sets, enforced across all instances
+- **Real-time in-app feed** — Redis Pub/Sub + Socket.IO WebSocket gateway with isolated tenant rooms
+- **Dual-cache feed engine** — O(log N) feed reads via Redis Sorted Sets, no database polling
+- **Horizontal scaling** — fully stateless app servers; all shared state lives in Redis and PostgreSQL
+- **Audit log** — append-only `NotificationEvent` ledger recording every lifecycle milestone
 
 ---
 
@@ -22,73 +23,306 @@ A multi-tenant notification platform that lets any client application send **ema
 
 | Layer | Technology |
 |---|---|
-| Runtime | Node.js |
-| Framework | NestJS |
+| Framework | NestJS (TypeScript) |
 | Database | PostgreSQL via Prisma ORM |
-| Cache | Redis Sorted Sets (ioredis) |
-| Pub/Sub | Redis Pub/Sub (dedicated subscriber connection) |
+| Cache & Queue | Redis (ioredis) |
+| Job Queue | BullMQ |
 | Real-time | Socket.IO |
-| Auth | SHA-256 API key hashing + signed JWT for WebSocket |
-| Rate Limiting | Redis Sorted Set sliding window, per tenant |
+| Auth | SHA-256 API keys + short-lived JWTs |
 
 ---
 
-## Getting Started
+## Architecture Overview
 
-### Prerequisites
+```
+POST /v1/notifications/trigger
+        │
+        ▼
+DistributedRedisLimiterGuard     ← sliding window rate limit per tenant
+        │
+        ▼
+IdempotencyInterceptor           ← duplicate request prevention via Redis Hash
+        │
+        ▼
+Validation + Template Compile    ← contact lookup, template fetch, {{var}} injection
+        │
+        ▼
+PostgreSQL: PENDING              ← notification row created, audit event appended
+        │
+        ▼
+BullMQ Job Enqueue               ← job added to notification_delivery queue
+        │
+        ▼
+201 → { success, jobId }         ← response returned immediately
 
-- Node.js 18+
-- PostgreSQL
-- Redis
+        ↓  (async, worker picks up job)
 
-### Setup
-
-```bash
-git clone https://github.com/your-username/naas
-cd naas
-npm install
+NotificationProcessor (WorkerHost)
+        │
+        ├── provider.send()      ← SendGrid / Twilio / FCM / mock
+        ├── PostgreSQL: SENT
+        │
+        └── IN_APP only:
+              redis.publish('platform:notifications')
+                    │
+                    ▼
+            Redis Pub/Sub ──→ All server instances
+                                    │
+                              WebSocket Gateway
+                              socket.to(room).emit('notification_received')
+                                    │
+                              Browser (live feed update)
 ```
 
-Create a `.env` file:
+---
 
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/naas
-REDIS_URL=redis://localhost:6379
-JWT_SECRET=your_secret_here
-PORT=3001
-WS_PORT=3002
+## API Reference
+
+### Authentication
+
+All endpoints require an `x-api-key` header. Keys are scoped to a tenant workspace. Raw keys are never stored — only SHA-256 digests.
+
+```
+x-api-key: ntf_live_your_key_here
 ```
 
-Run database migrations:
+### Trigger a Notification
 
-```bash
-npx prisma migrate dev
+```
+POST /v1/notifications/trigger
 ```
 
-Start the server:
+**Headers**
 
-```bash
-npm run dev
+| Header | Required | Description |
+|---|---|---|
+| `x-api-key` | Yes | Tenant API key |
+| `x-idempotency-key` | Yes | Client-generated unique key per logical operation (UUID recommended) |
+
+**Body**
+
+```json
+{
+  "workflow": "welcome-alert",
+  "recipientId": "user_dev_99",
+  "data": {
+    "name": "Kunal",
+    "action": "account verified"
+  }
+}
 ```
 
-### Testing horizontal scaling locally
+| Field | Type | Description |
+|---|---|---|
+| `workflow` | string | Template slug — matches `Template.slug` for this tenant |
+| `recipientId` | string | Contact's `externalId` within the tenant workspace |
+| `data` | object | Variables injected into `{{variable}}` placeholders in the template |
 
-Simulate multiple server instances on your machine without a load balancer:
+**Response `201`**
 
-```bash
-# Terminal 1
-PORT=3001 npm run start:dev
-
-# Terminal 2
-PORT=3002 npm run start:dev
-
-# Terminal 3
-PORT=3003 npm run start:dev
+```json
+{
+  "success": true,
+  "jobId": "42",
+  "message": "Notification successfully queued for delivery"
+}
 ```
 
-Connect a WebSocket client to port `3001`, send a trigger request to port `3002`, and observe the notification arrive on the `3001` socket. That proves Redis Pub/Sub is working across instances.
+**Errors**
 
-To verify distributed rate limiting, hammer any instance with requests beyond the configured limit — the 429 will fire regardless of which instance receives each individual request, because the counter lives in shared Redis.
+| Code | Reason |
+|---|---|
+| `400` | Missing `x-idempotency-key` header, or key reused with different request body |
+| `404` | Contact not found or inactive, or template/workflow not found |
+| `409` | Idempotency lock active — duplicate request is currently being processed |
+| `429` | Rate limit exceeded for this tenant |
+
+---
+
+### Get Notification Feed
+
+```
+GET /v1/notifications/feed?recipientId=user_dev_99&unreadOnly=false
+```
+
+Returns a paginated notification feed for a user. Served from Redis cache (O(log N)) with automatic PostgreSQL fallback on cache miss.
+
+**Query params**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `recipientId` | string | required | Target user's `externalId` |
+| `unreadOnly` | boolean | `false` | Return only unread notifications when `true` |
+
+---
+
+### Mark Notification as Read
+
+```
+PATCH /v1/notifications/:id/read
+```
+
+Sets `isRead = true` in PostgreSQL, removes the entry from the `feed:unread` cache, and re-inserts the updated copy into `feed:all` at the same score position.
+
+---
+
+### Mark All Notifications as Read
+
+```
+POST /v1/notifications/read-all
+```
+
+Bulk update — sets all unread notifications for the user to `isRead = true`. Both Redis cache keys (`feed:all`, `feed:unread`) are deleted and rebuilt on the next feed request.
+
+**Body**
+
+```json
+{
+  "recipientId": "user_dev_99"
+}
+```
+
+---
+
+## Idempotency
+
+Every `POST /v1/notifications/trigger` request **must** include an `x-idempotency-key` header. This is a client-generated unique string (UUID recommended) that identifies one logical send operation.
+
+**Behaviour:**
+
+| Scenario | Response |
+|---|---|
+| First request with this key | Processes normally, caches the response |
+| Replay with same key + same body | Returns the original cached response immediately — no duplicate job enqueued |
+| Replay with same key + different body | `400 Bad Request` — key reuse detected |
+| Concurrent duplicate (still processing) | `409 Conflict` — lock is active |
+
+Keys expire after **24 hours**.
+
+```
+// Example
+x-idempotency-key: 7f3e2c1a-4b5d-4e6f-9a0b-1c2d3e4f5a6b
+```
+
+---
+
+## Rate Limiting
+
+Requests to `POST /v1/notifications/trigger` are rate-limited per tenant using a **sliding window algorithm** backed by Redis Sorted Sets.
+
+- Limit state lives in Redis — correctly enforced across all horizontally scaled instances
+- Unlike a fixed window, there is no burst spike at clock boundaries
+- On limit breach: `429 Too Many Requests`
+- On Redis failure: fail-open (requests pass through, auth still runs)
+
+Configure `RATE_LIMIT_CONFIG.WINDOW_DURATION_MS` and `RATE_LIMIT_CONFIG.MAX_REQUESTS` in `notification.constants.ts`.
+
+---
+
+## Real-Time WebSocket Feed
+
+Clients connect via Socket.IO and receive live `notification_received` events for IN_APP notifications.
+
+### Connection
+
+```javascript
+import { io } from 'socket.io-client';
+
+const socket = io('http://your-naas-host', {
+  auth: {
+    token: '<signed_jwt_from_your_backend>'
+  }
+});
+
+socket.on('notification_received', (notification) => {
+  console.log('New notification:', notification);
+});
+```
+
+### JWT
+
+The JWT must be signed by your backend (using the shared `JWT_SECRET`) and contain:
+
+```json
+{
+  "tenantId": "your-tenant-id",
+  "userId": "user_dev_99"
+}
+```
+
+Your backend signs the JWT server-side and passes it to the browser. The raw API key is never exposed to the client.
+
+### Horizontal scaling
+
+The WebSocket gateway uses Redis Pub/Sub as a cross-instance broadcast layer. Any server can process a notification trigger — the instance holding the user's socket connection will always receive the event and deliver it to the browser.
+
+---
+
+## Job Queue
+
+Notification delivery runs through a **BullMQ** job queue backed by Redis. This decouples the HTTP response from provider dispatch and provides:
+
+- **Automatic retry** — 3 attempts with exponential backoff (5s → 10s → 20s)
+- **Crash recovery** — stalled jobs are re-queued on server restart
+- **Observability** — queue state is inspectable via Bull Board or similar dashboards
+- **Backpressure** — queue absorbs traffic spikes without overwhelming providers
+
+The API returns a `jobId` in the trigger response which can be used to track job state.
+
+---
+
+## Cache Design
+
+### Feed cache (Redis Sorted Sets)
+
+Two Sorted Sets are maintained per user, scored by notification timestamp:
+
+| Key | Contents |
+|---|---|
+| `feed:all:{tenantId}:{recipientId}` | All notifications |
+| `feed:unread:{tenantId}:{recipientId}` | Unread notifications only |
+
+- Max **100 entries** per key — oldest trimmed on every insert
+- **7-day rolling TTL** — inactive user caches expire automatically
+- Feed reads return in **under 2ms** from cache (O(log N))
+
+### Idempotency cache (Redis Hash)
+
+```
+idempotency:{tenantId}:{x-idempotency-key}
+```
+
+Hash fields: `status`, `request_hash`, `response_body`. TTL: 24 hours.
+
+### API key cache (Redis String)
+
+```
+apikey:{sha256_of_key}  →  tenantId
+```
+
+Avoids a database query on every inbound request. TTL: 24 hours.
+
+### Rate limit state (Redis Sorted Set)
+
+```
+ratelimit:{tenantId}
+```
+
+Sliding window of request timestamps. Trimmed on every request. Rolling TTL.
+
+---
+
+## Data Model Summary
+
+| Model | Purpose |
+|---|---|
+| `Tenant` | Root workspace anchor — all resources belong to a tenant |
+| `ApiKey` | SHA-256 hashed credentials for server-to-server auth |
+| `Contact` | End-user routing profiles — email, phone, device tokens |
+| `Template` | Notification layouts with `{{variable}}` slots, scoped to channel |
+| `ChannelConfig` | Encrypted provider credentials per channel per tenant |
+| `Notification` | Per-send instance — compiled body, delivery state, timestamps |
+| `NotificationEvent` | Append-only audit log — every status transition recorded |
 
 ---
 
@@ -98,340 +332,55 @@ To verify distributed rate limiting, hammer any instance with requests beyond th
 src/
 ├── notification/
 │   ├── constants/
-│   │   └── notification.constants.ts   # Redis channel names, WS events, cache key factory, rate limit config
-│   ├── events/
-│   │   └── notification-event.ts       # Typed event payload definitions
+│   │   └── notification.constants.ts   ← all Redis keys, queue names, event names
 │   ├── guards/
-│   │   └── distributed-redis-limiter.guard.ts  # Sliding window rate limiter
-│   ├── notification.gateway.ts         # WebSocket gateway + Redis Pub/Sub subscriber
-│   ├── notification.service.ts         # Trigger logic + Redis publisher
-│   └── notification.controller.ts      # HTTP route handlers
+│   │   └── distributed-redis-limiter.guard.ts
+│   ├── interceptors/
+│   │   └── idempotency.interceptor.ts
+│   ├── provider/
+│   │   └── provider.factory.ts         ← resolves SendGrid / Twilio / FCM / mock
+│   ├── notification.controller.ts
+│   ├── notification.gateway.ts         ← Socket.IO + Redis Pub/Sub subscriber
+│   ├── notification.module.ts
+│   ├── notification.processor.ts       ← BullMQ WorkerHost
+│   └── notification.service.ts
 ├── redis/
-│   └── redis.module.ts                 # Redis client + dedicated subscriber client
-└── prisma/
-    └── schema.prisma
+│   └── redis.module.ts                 ← REDIS_CLIENT + REDIS_SUBSCRIBER providers
+├── prisma/
+│   └── prisma.service.ts
+└── main.ts
 ```
 
 ---
 
-## How it Works
+## Environment Variables
 
-### The core flow
-
-```
-POST /v1/notifications/trigger
-        │
-        ├── 0. DistributedRedisLimiterGuard
-        │       ├── hash API key → look up tenantId (Redis cache → DB fallback)
-        │       ├── ZREMRANGEBYSCORE: evict stale entries from sliding window
-        │       ├── ZADD: record this request with timestamp score
-        │       ├── ZCARD: count requests in window
-        │       └── if count > MAX_REQUESTS → 429 Too Many Requests
-        │
-        ├── 1. Hash API key → resolve tenant
-        ├── 2. Look up contact by externalId
-        ├── 3. Fetch template by (slug + channel)
-        ├── 4. Compile {{variables}} into body
-        ├── 5. Write Notification row (status: PENDING)
-        └── 6. Return 201 immediately ← fast response, caller never waits
-                │
-                └── background worker picks up async
-                        ├── status → PROCESSING
-                        ├── simulate provider dispatch
-                        ├── status → SENT
-                        └── redis.publish('platform:notifications', payload)
-                                │
-                                └── Redis broadcasts to ALL server instances
-                                        │
-                                        └── whichever instance holds the
-                                            user's socket pushes to browser
-```
-
-### Why async?
-
-The HTTP response returns before the notification is actually sent. This keeps API response times fast regardless of whether the downstream provider (SendGrid, Twilio, etc.) is slow. The client gets a notification `id` immediately and can track status via the audit log.
-
-### Why dual Redis cache?
-
-Every in-app notification is written into two Redis Sorted Sets simultaneously, scored by Unix millisecond timestamp:
-
-- `feed:all:{tenantId}:{userId}` — every notification, read and unread
-- `feed:unread:{tenantId}:{userId}` — only unread items, for badge counts
-
-A feed request never touches PostgreSQL on a cache hit — it's a single sorted set range query in O(log N). The cache holds the 100 most recent notifications per user with a 7-day rolling TTL.
-
-### Why Redis Pub/Sub for WebSocket broadcasting?
-
-When running a single server, an in-process event emitter works fine. Under a load balancer with multiple instances it breaks:
-
-- A user's WebSocket connection is persistent — it lives on whichever server they first connected to
-- An HTTP trigger request goes to whichever server the load balancer picks — could be any instance
-- If the trigger is processed on Server B but the user's socket is on Server A, the in-memory event never crosses that boundary
-
-Redis Pub/Sub sits outside all servers. Any instance publishes to it, every instance receives the broadcast. Whichever instance holds the user's socket pushes to the browser. The others silently ignore it.
-
-This required two separate Redis connections:
-
-```
-redisClient      → regular operations (GET, SET, ZADD, pipeline, publish)
-redisSubscriber  → dedicated to subscribe mode only
-```
-
-A connection in subscribe mode is blocked — Redis won't let it run any other commands. So the subscriber is always a dedicated separate client.
-
-### Why Redis sliding window for rate limiting?
-
-A fixed window counter (`INCR` + `EXPIRE`) resets at a hard clock boundary. A tenant can drain their full quota at second 59 of a window and then immediately fire again at second 0 of the next — effectively doubling throughput at every boundary.
-
-A sliding window stores each request as a timestamped entry in a Redis Sorted Set. On every request it evicts entries older than the window and counts what remains. There is no reset boundary — the window rolls continuously with real time.
-
-Because the counter lives in Redis (not instance memory), it is correctly accumulated across all horizontally scaled server instances. A tenant splitting 100 requests across three servers still sees a single counter.
-
-The guard is intentionally **fail-open**: if Redis is temporarily unavailable, requests pass through rather than taking down the API. Authentication still rejects invalid keys. Rate limiting is a protection layer, not an authentication layer.
-
-### WebSocket auth
-
-Exposing an API key to the browser would be a security hole. Instead:
-
-1. The tenant's own backend signs a short-lived JWT `{ tenantId, userId, expires }`
-2. The browser passes this token to the WebSocket gateway on connect
-3. The gateway verifies the signature and places the client into an isolated room: `tenantId:userId`
-
-A stolen token only exposes that specific user's own feed. Tampering with the payload breaks the cryptographic signature — the gateway closes the connection immediately.
-
----
-
-## API Reference
-
-Base URL: `http://localhost:3001`
-
-All requests require:
-
-```
-x-api-key: your_raw_api_key
-```
-
-Requests exceeding the per-tenant rate limit receive:
-
-```
-HTTP 429 Too Many Requests
-{
-  "statusCode": 429,
-  "error": "Too many Request",
-  "message": "Rate Limit threshold exceeded. Dynamic shield blocked request"
-}
-```
-
----
-
-### Notifications
-
-#### Trigger a notification
-
-```
-POST /v1/notifications/trigger
-```
-
-Compiles a template, creates a notification record, and dispatches it asynchronously. Returns immediately — processing happens in the background.
-
-**Guards:** `DistributedRedisLimiterGuard` — enforces per-tenant sliding window rate limit before any business logic runs.
-
-**Request body**
-
-```json
-{
-  "workflow": "welcome-alert",
-  "recipientId": "user_dev_99",
-  "data": {
-    "name": "Kunal"
-  }
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `workflow` | string | Yes | The template slug to use. |
-| `recipientId` | string | Yes | Your internal user ID (maps to a Contact). |
-| `data` | object | No | Variables to inject into the template body. |
-
-**Response** `201 Created`
-
-```json
-{
-  "id": "notif_abc123",
-  "status": "PENDING"
-}
-```
-
-**Errors**
-
-| Code | Reason |
+| Variable | Description |
 |---|---|
-| `401` | Invalid or missing API key. |
-| `404` | No contact found for this `recipientId`. |
-| `404` | No active template found for this `workflow`. |
-| `429` | Per-tenant rate limit exceeded. |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_HOST` | Redis hostname (default: `localhost`) |
+| `REDIS_PORT` | Redis port (default: `6379`) |
+| `JWT_SECRET` | Secret used to sign and verify WebSocket JWTs |
 
 ---
 
-#### Get notification feed
+## Getting Started
 
+```bash
+# Install dependencies
+npm install
+
+# Run database migrations
+npx prisma migrate dev
+
+# Start the server
+npm run start:dev
 ```
-GET /v1/notifications/feed
-```
 
-Returns a user's notification history. Hits Redis cache first — falls back to PostgreSQL on miss and warms the cache for next time.
-
-**Query params**
-
-| Param | Type | Required | Description |
-|---|---|---|---|
-| `recipientId` | string | Yes | Your internal user ID. |
-| `unreadOnly` | boolean | No | `true` returns only unread notifications. Default `false`. |
-
-**Response** `200 OK`
-
-```json
-[
-  {
-    "id": "notif_abc123",
-    "body": "Hi Kunal, thanks for signing up.",
-    "channel": "IN_APP",
-    "isRead": false,
-    "createdAt": "2024-01-01T00:00:00Z"
-  }
-]
-```
+Redis and PostgreSQL must be running. Configure connection details in `.env`.
 
 ---
 
-#### Mark a notification as read
+## Internal Documentation
 
-```
-PATCH /v1/notifications/:id/read
-```
-
-Marks a single notification as read. Updates PostgreSQL, then surgically updates both Redis cache sets — removes from `feed:unread` and replaces the stale entry in `feed:all` with an updated `isRead: true` version at the same score position.
-
-**Response** `200 OK`
-
-```json
-{
-  "id": "notif_abc123",
-  "isRead": true,
-  "readAt": "2024-01-01T00:01:00Z"
-}
-```
-
-**Errors**
-
-| Code | Reason |
-|---|---|
-| `404` | Notification not found or belongs to a different tenant. |
-
----
-
-#### Mark all notifications as read
-
-```
-POST /v1/notifications/read-all
-```
-
-Bulk marks all unread notifications as read for a user. Rather than updating individual cache entries, drops both cache keys entirely — rebuilt fresh on the next feed request.
-
-**Request body**
-
-```json
-{
-  "recipientId": "user_dev_99"
-}
-```
-
-**Response** `200 OK`
-
-```json
-{
-  "updated": 12
-}
-```
-
----
-
-## Real-Time (WebSocket)
-
-Connect via Socket.IO on port `3002`.
-
-```javascript
-const socket = io('http://localhost:3002', {
-  auth: { token: 'your_signed_jwt' }
-});
-
-socket.on('notification_received', (notification) => {
-  console.log('New notification:', notification);
-});
-```
-
-The server places you into a private room on connect (`tenantId:userId`). You only receive events for your own user — no cross-tenant or cross-user data leaks.
-
----
-
-## Database Schema
-
-Full schema lives in `prisma/schema.prisma`. Key models:
-
-| Model | Purpose |
-|---|---|
-| `Tenant` | Root workspace. Every other model belongs to a tenant. |
-| `ApiKey` | Hashed credentials for server-to-server auth. |
-| `Contact` | End-users mapped to a tenant by `externalId`. |
-| `Template` | Notification layouts with Handlebars variable support. |
-| `ChannelConfig` | Per-tenant provider credentials (SendGrid, Twilio, FCM). |
-| `Notification` | Every notification instance with full status tracking. |
-| `NotificationEvent` | Append-only audit log of every lifecycle event. |
-
----
-
-## Redis Key Reference
-
-| Key Pattern | Type | TTL | Purpose |
-|---|---|---|---|
-| `feed:all:{tenantId}:{userId}` | ZSET | 7 days rolling | Full notification feed per user. |
-| `feed:unread:{tenantId}:{userId}` | ZSET | 7 days rolling | Unread-only feed for badge counts. |
-| `apikey:{keyHash}` | String | 24h | Maps API key hash → tenantId, avoids DB lookup on hot paths. |
-| `ratelimit:{tenantId}` | ZSET | Rolling (window size) | Sliding window request log per tenant. |
-
----
-
-## What's Next
-
-The current implementation is architected correctly for the core flow. These are the gaps to close before production use:
-
-**Job Queue (BullMQ)**
-Background processing is a forked async function right now. Replacing it with BullMQ adds proper retries, concurrency limits, per-tenant rate limiting at the queue level, and a dead-letter queue for permanently failed jobs. The async architecture is already in place — this is a drop-in upgrade.
-
-**Real Provider Adapters**
-Dispatch is currently simulated with a timeout. The `ChannelConfig` model already stores per-tenant credentials for SendGrid, Twilio, and FCM. Plugging in real adapters is the next step.
-
-**API key revocation cache invalidation**
-When an API key is revoked, the `apikey:{keyHash}` cache entry survives for up to 24 hours. The downstream auth interceptor will still reject the revoked key, but the rate limit counter will continue attributing requests to the old tenant until the TTL expires. The fix is to `DEL apikey:{keyHash}` in Redis at the moment of revocation.
-
-**Configurable rate limits per tenant**
-`RATE_LIMIT_CONFIG` is currently a global constant. A future version could store per-tenant overrides in PostgreSQL (or Redis itself), fetched and cached alongside the tenant ID lookup so high-volume tenants can be given higher limits without a code change.
-
----
-
-## What I Learned Building This
-
-- How to structure a multi-tenant system where every query is scoped by `tenantId` without leaking data across workspaces
-- Why you maintain separate read and unread cache sets — filtering a single set on every request defeats the purpose of caching
-- The exact failure mode of in-memory event emitters under horizontal scaling, and why Redis Pub/Sub is the standard fix
-- Why a Redis subscriber connection must be dedicated and separate — a subscribed connection is blocked from all other commands
-- How WebSocket room isolation works and why JWTs are the right auth mechanism for real-time connections vs passing API keys to the browser
-- The nuke-and-rebuild invalidation pattern for bulk operations — cheaper than surgically updating dozens of individual cache entries
-- Why a sliding window rate limiter beats a fixed window counter — no boundary spike, no artificial doubling of quota at the reset moment
-- How to implement distributed rate limiting correctly — storing state in Redis rather than instance memory so the limit holds across all scaled servers
-- The fail-open pattern for infrastructure guards — rate limiting should protect the system, not become a single point of failure
-
----
-
-*Templates, Contacts, and ChannelConfig management endpoints coming next.*
+For full architecture details — infrastructure diagrams, schema definitions, Redis key design, BullMQ worker internals, rate limiting algorithm, idempotency lifecycle, WebSocket gateway, security model, and implementation decisions — see [`docs/system-architecture.md`](./docs/system-architecture.md).

@@ -62,6 +62,12 @@ export const CacheKeyFactory = {
      */
     getApikey (keyhash: string): string {
         return `auth:key:${keyhash}`;
+    },
+    /**
+     * Generate key for th caching of idempotency key
+     */
+    getIdempotencyKey (tenantId: string,idempotencyKey: string) {
+        return `idempotency:tenant_${tenantId}:key_${idempotencyKey}`;
     }
 }
 
